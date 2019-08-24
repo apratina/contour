@@ -1,4 +1,4 @@
-# Heptio Contour Deployment on AWS with NLB
+# Contour Deployment on AWS with NLB
 
 This is an advanced deployment guide to configure Contour on AWS with the [Network Load Balancer (NLB)][1].
 This configuration has several advantages:
@@ -17,7 +17,7 @@ This configuration has several advantages:
 ## Deploying Contour
 
 1. [Clone the Contour repository][4] and cd into the repo.
-2. Run `kubectl apply -f deployment/ds-hostnet/`
+2. Run `kubectl apply -f examples/ds-hostnet/`
 
 This creates the `heptio-contour` Namespace along with a ServiceAccount, RBAC rules, and the DaemonSet itself.  It also creates the NLB based loadbalancer for you.
 

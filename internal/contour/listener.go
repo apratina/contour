@@ -14,14 +14,17 @@
 package contour
 
 import (
+	"sort"
 	"sync"
 
-	"github.com/envoyproxy/go-control-plane/envoy/api/v2"
+	"github.com/envoyproxy/go-control-plane/envoy/api/v2/auth"
+
+	v2 "github.com/envoyproxy/go-control-plane/envoy/api/v2"
 	"github.com/envoyproxy/go-control-plane/envoy/api/v2/listener"
+	"github.com/envoyproxy/go-control-plane/pkg/cache"
 	"github.com/gogo/protobuf/proto"
 	"github.com/heptio/contour/internal/dag"
 	"github.com/heptio/contour/internal/envoy"
-	"k8s.io/api/core/v1"
 )
 
 const (
@@ -61,10 +64,13 @@ type ListenerVisitorConfig struct {
 	// If not set, defaults to DEFAULT_HTTPS_ACCESS_LOG.
 	HTTPSAccessLog string
 
-	// UseProxyProto configurs all listeners to expect a PROXY protocol
-	// V1 header on new connections.
+	// UseProxyProto configures all listeners to expect a PROXY
+	// V1 or V2 preamble.
 	// If not set, defaults to false.
 	UseProxyProto bool
+
+	// MinimumProtocolVersion defines the min tls protocol version to be used
+	MinimumProtocolVersion auth.TlsParameters_TlsProtocol
 }
 
 // httpAddress returns the port for the HTTP (non TLS)
@@ -121,12 +127,32 @@ func (lvc *ListenerVisitorConfig) httpsAccessLog() string {
 	return DEFAULT_HTTPS_ACCESS_LOG
 }
 
+// minProtocolVersion returns the requested minimum TLS protocol
+// version or auth.TlsParameters_TLSv1_1 if not configured {
+func (lvc *ListenerVisitorConfig) minProtoVersion() auth.TlsParameters_TlsProtocol {
+	if lvc.MinimumProtocolVersion > auth.TlsParameters_TLSv1_1 {
+		return lvc.MinimumProtocolVersion
+	}
+	return auth.TlsParameters_TLSv1_1
+}
+
 // ListenerCache manages the contents of the gRPC LDS cache.
 type ListenerCache struct {
-	mu      sync.Mutex
-	values  map[string]*v2.Listener
-	waiters []chan int
-	last    int
+	mu           sync.Mutex
+	values       map[string]*v2.Listener
+	staticValues map[string]*v2.Listener
+	waiters      []chan int
+	last         int
+}
+
+// NewListenerCache returns an instance of a ListenerCache
+func NewListenerCache(address string, port int) ListenerCache {
+	stats := envoy.StatsListener(address, port)
+	return ListenerCache{
+		staticValues: map[string]*v2.Listener{
+			stats.Name: stats,
+		},
+	}
 }
 
 // Register registers ch to receive a value when Notify is called.
@@ -154,13 +180,8 @@ func (c *ListenerCache) Update(v map[string]*v2.Listener) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	c.values = v
-	c.notify()
-}
-
-// notify notifies all registered waiters that an event has occurred.
-func (c *ListenerCache) notify() {
 	c.last++
+	c.values = v
 
 	for _, ch := range c.waiters {
 		ch <- c.last
@@ -168,18 +189,53 @@ func (c *ListenerCache) notify() {
 	c.waiters = c.waiters[:0]
 }
 
-// Values returns a slice of the value stored in the cache.
-func (c *ListenerCache) Values(filter func(string) bool) []proto.Message {
+// Contents returns a copy of the cache's contents.
+func (c *ListenerCache) Contents() []proto.Message {
 	c.mu.Lock()
-	values := make([]proto.Message, 0, len(c.values))
+	defer c.mu.Unlock()
+	var values []proto.Message
 	for _, v := range c.values {
-		if filter(v.Name) {
-			values = append(values, v)
-		}
+		values = append(values, v)
 	}
-	c.mu.Unlock()
+	for _, v := range c.staticValues {
+		values = append(values, v)
+	}
+	sort.Stable(listenersByName(values))
 	return values
 }
+
+func (c *ListenerCache) Query(names []string) []proto.Message {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var values []proto.Message
+	for _, n := range names {
+		v, ok := c.values[n]
+		if !ok {
+			v, ok = c.staticValues[n]
+			if !ok {
+				// if the listener is not registered in
+				// dynamic or static values then skip it
+				// as there is no way to return a blank
+				// listener because the listener address
+				// field is required.
+				continue
+			}
+		}
+		values = append(values, v)
+	}
+	sort.Stable(listenersByName(values))
+	return values
+}
+
+type listenersByName []proto.Message
+
+func (l listenersByName) Len() int      { return len(l) }
+func (l listenersByName) Swap(i, j int) { l[i], l[j] = l[j], l[i] }
+func (l listenersByName) Less(i, j int) bool {
+	return l[i].(*v2.Listener).Name < l[j].(*v2.Listener).Name
+}
+
+func (*ListenerCache) TypeURL() string { return cache.ListenerType }
 
 type listenerVisitor struct {
 	*ListenerVisitorConfig
@@ -192,37 +248,65 @@ func visitListeners(root dag.Vertex, lvc *ListenerVisitorConfig) map[string]*v2.
 	lv := listenerVisitor{
 		ListenerVisitorConfig: lvc,
 		listeners: map[string]*v2.Listener{
-			ENVOY_HTTP_LISTENER: {
-				Name:    ENVOY_HTTP_LISTENER,
-				Address: envoy.SocketAddress(lvc.httpAddress(), lvc.httpPort()),
-				FilterChains: []listener.FilterChain{{
-					Filters: []listener.Filter{
-						envoy.HTTPConnectionManager(ENVOY_HTTP_LISTENER, lvc.httpAccessLog()),
-					},
-					UseProxyProto: bv(lvc.UseProxyProto),
-				}},
-			},
-			ENVOY_HTTPS_LISTENER: {
-				Name:    ENVOY_HTTPS_LISTENER,
-				Address: envoy.SocketAddress(lvc.httpsAddress(), lvc.httpsPort()),
-				ListenerFilters: []listener.ListenerFilter{
-					envoy.TLSInspector(),
-				},
-			},
+			ENVOY_HTTPS_LISTENER: envoy.Listener(
+				ENVOY_HTTPS_LISTENER,
+				lvc.httpsAddress(), lvc.httpsPort(),
+				secureProxyProtocol(lvc.UseProxyProto),
+			),
 		},
 	}
 	lv.visit(root)
 
-	if !lv.http {
-		delete(lv.listeners, ENVOY_HTTP_LISTENER)
+	// add a listener if there are vhosts bound to http.
+	if lv.http {
+		lv.listeners[ENVOY_HTTP_LISTENER] = envoy.Listener(
+			ENVOY_HTTP_LISTENER,
+			lvc.httpAddress(), lvc.httpPort(),
+			proxyProtocol(lvc.UseProxyProto),
+			envoy.HTTPConnectionManager(ENVOY_HTTP_LISTENER, lvc.httpAccessLog()),
+		)
+
 	}
+
+	// remove the https listener if there are no vhosts bound to it.
 	if len(lv.listeners[ENVOY_HTTPS_LISTENER].FilterChains) == 0 {
 		delete(lv.listeners, ENVOY_HTTPS_LISTENER)
+	} else {
+		// there's some https listeners, we need to sort the filter chains
+		// to ensure that the LDS entries are identical.
+		sort.SliceStable(lv.listeners[ENVOY_HTTPS_LISTENER].FilterChains,
+			func(i, j int) bool {
+				// The ServerNames field will only ever have a single entry
+				// in our FilterChain config, so it's okay to only sort
+				// on the first slice entry.
+				return lv.listeners[ENVOY_HTTPS_LISTENER].FilterChains[i].FilterChainMatch.ServerNames[0] < lv.listeners[ENVOY_HTTPS_LISTENER].FilterChains[j].FilterChainMatch.ServerNames[0]
+			})
 	}
+
 	return lv.listeners
 }
 
+func proxyProtocol(useProxy bool) []listener.ListenerFilter {
+	if useProxy {
+		return []listener.ListenerFilter{
+			envoy.ProxyProtocol(),
+		}
+	}
+	return nil
+}
+
+func secureProxyProtocol(useProxy bool) []listener.ListenerFilter {
+	return append(proxyProtocol(useProxy), envoy.TLSInspector())
+}
+
 func (v *listenerVisitor) visit(vertex dag.Vertex) {
+	max := func(a, b auth.TlsParameters_TlsProtocol) auth.TlsParameters_TlsProtocol {
+		if a > b {
+			return a
+		}
+		return b
+	}
+
 	switch vh := vertex.(type) {
 	case *dag.VirtualHost:
 		// we only create on http listener so record the fact
@@ -241,19 +325,13 @@ func (v *listenerVisitor) visit(vertex dag.Vertex) {
 			alpnProtos = nil // do not offer ALPN
 		}
 
-		fc := listener.FilterChain{
-			FilterChainMatch: &listener.FilterChainMatch{
-				ServerNames: []string{vh.Host},
-			},
-			Filters:       filters,
-			UseProxyProto: bv(v.UseProxyProto),
-		}
-
-		// attach certificate data to this listener if provided.
-		if vh.Secret != nil {
-			data := vh.Secret.Data()
-			fc.TlsContext = envoy.DownstreamTLSContext(data[v1.TLSCertKey], data[v1.TLSPrivateKeyKey], vh.MinProtoVersion, alpnProtos...)
-		}
+		fc := envoy.FilterChainTLS(
+			vh.VirtualHost.Name,
+			vh.Secret,
+			filters,
+			max(v.ListenerVisitorConfig.minProtoVersion(), vh.MinProtoVersion), // choose the higher of the configured or requested tls version
+			alpnProtos...,
+		)
 
 		v.listeners[ENVOY_HTTPS_LISTENER].FilterChains = append(v.listeners[ENVOY_HTTPS_LISTENER].FilterChains, fc)
 	default:

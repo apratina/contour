@@ -16,10 +16,8 @@ package contour
 import (
 	"testing"
 
-	"github.com/gogo/protobuf/proto"
-	"github.com/heptio/contour/internal/dag"
 	"github.com/sirupsen/logrus"
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -36,12 +34,6 @@ type testWriter struct {
 func (t *testWriter) Write(buf []byte) (int, error) {
 	t.Logf("%s", buf)
 	return len(buf), nil
-}
-
-func contents(v interface {
-	Values(func(string) bool) []proto.Message
-}) []proto.Message {
-	return v.Values(func(string) bool { return true })
 }
 
 func endpoints(ns, name string, subsets ...v1.EndpointSubset) *v1.Endpoints {
@@ -69,7 +61,3 @@ func ports(ps ...int32) []v1.EndpointPort {
 	}
 	return ports
 }
-
-type nullNotifier int
-
-func (nn *nullNotifier) OnChange(b *dag.Builder) {}

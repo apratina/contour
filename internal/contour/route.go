@@ -17,8 +17,9 @@ import (
 	"sort"
 	"sync"
 
-	"github.com/envoyproxy/go-control-plane/envoy/api/v2"
+	v2 "github.com/envoyproxy/go-control-plane/envoy/api/v2"
 	"github.com/envoyproxy/go-control-plane/envoy/api/v2/route"
+	"github.com/envoyproxy/go-control-plane/pkg/cache"
 	"github.com/gogo/protobuf/proto"
 	"github.com/gogo/protobuf/types"
 	"github.com/heptio/contour/internal/dag"
@@ -58,13 +59,8 @@ func (c *RouteCache) Update(v map[string]*v2.RouteConfiguration) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	c.values = v
-	c.notify()
-}
-
-// notify notifies all registered waiters that an event has occurred.
-func (c *RouteCache) notify() {
 	c.last++
+	c.values = v
 
 	for _, ch := range c.waiters {
 		ch <- c.last
@@ -72,18 +68,49 @@ func (c *RouteCache) notify() {
 	c.waiters = c.waiters[:0]
 }
 
-// Values returns a slice of the value stored in the cache.
-func (c *RouteCache) Values(filter func(string) bool) []proto.Message {
+// Contents returns a copy of the cache's contents.
+func (c *RouteCache) Contents() []proto.Message {
 	c.mu.Lock()
-	values := make([]proto.Message, 0, len(c.values))
+	defer c.mu.Unlock()
+	var values []proto.Message
 	for _, v := range c.values {
-		if filter(v.Name) {
-			values = append(values, v)
-		}
+		values = append(values, v)
 	}
-	c.mu.Unlock()
+	sort.Stable(routeConfigurationsByName(values))
 	return values
 }
+
+func (c *RouteCache) Query(names []string) []proto.Message {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var values []proto.Message
+	for _, n := range names {
+		v, ok := c.values[n]
+		if !ok {
+			// if there is no route registered with the cache
+			// we return a blank route configuration. This is
+			// not the same as returning nil, we're choosing to
+			// say "the configuration you asked for _does exists_,
+			// but it contains no useful information.
+			v = &v2.RouteConfiguration{
+				Name: n,
+			}
+		}
+		values = append(values, v)
+	}
+	sort.Stable(routeConfigurationsByName(values))
+	return values
+}
+
+type routeConfigurationsByName []proto.Message
+
+func (r routeConfigurationsByName) Len() int      { return len(r) }
+func (r routeConfigurationsByName) Swap(i, j int) { r[i], r[j] = r[j], r[i] }
+func (r routeConfigurationsByName) Less(i, j int) bool {
+	return r[i].(*v2.RouteConfiguration).Name < r[j].(*v2.RouteConfiguration).Name
+}
+
+func (*RouteCache) TypeURL() string { return cache.RouteType }
 
 type routeVisitor struct {
 	routes map[string]*v2.RouteConfiguration
@@ -108,64 +135,74 @@ func visitRoutes(root dag.Vertex) map[string]*v2.RouteConfiguration {
 }
 
 func (v *routeVisitor) visit(vertex dag.Vertex) {
-	switch vh := vertex.(type) {
-	case *dag.VirtualHost:
-		vhost := envoy.VirtualHost(vh.Host, 80)
-		vh.Visit(func(r dag.Vertex) {
-			switch r := r.(type) {
-			case *dag.Route:
-				var svcs []*dag.HTTPService
-				r.Visit(func(s dag.Vertex) {
-					if s, ok := s.(*dag.HTTPService); ok {
-						svcs = append(svcs, s)
-					}
-				})
-				if len(svcs) < 1 {
-					// no services for this route, skip it.
-					return
-				}
-				rr := route.Route{
-					Match:  envoy.PrefixMatch(r.Prefix),
-					Action: envoy.RouteRoute(r, svcs),
-				}
+	switch l := vertex.(type) {
+	case *dag.Listener:
+		l.Visit(func(vertex dag.Vertex) {
+			switch vh := vertex.(type) {
+			case *dag.VirtualHost:
+				vhost := envoy.VirtualHost(vh.Name)
+				vh.Visit(func(v dag.Vertex) {
+					switch r := v.(type) {
+					case *dag.PrefixRoute:
+						rr := route.Route{
+							Match:               envoy.RoutePrefix(r.Prefix),
+							Action:              envoy.RouteRoute(&r.Route),
+							RequestHeadersToAdd: envoy.RouteHeaders(),
+						}
 
-				if r.HTTPSUpgrade {
-					rr.Action = envoy.UpgradeHTTPS()
-				}
-				vhost.Routes = append(vhost.Routes, rr)
-			}
-		})
-		if len(vhost.Routes) < 1 {
-			return
-		}
-		sort.Stable(sort.Reverse(longestRouteFirst(vhost.Routes)))
-		v.routes["ingress_http"].VirtualHosts = append(v.routes["ingress_http"].VirtualHosts, vhost)
-	case *dag.SecureVirtualHost:
-		vhost := envoy.VirtualHost(vh.Host, 443)
-		vh.Visit(func(r dag.Vertex) {
-			switch r := r.(type) {
-			case *dag.Route:
-				var svcs []*dag.HTTPService
-				r.Visit(func(s dag.Vertex) {
-					if s, ok := s.(*dag.HTTPService); ok {
-						svcs = append(svcs, s)
+						if r.HTTPSUpgrade {
+							rr.Action = envoy.UpgradeHTTPS()
+							rr.RequestHeadersToAdd = nil
+						}
+						vhost.Routes = append(vhost.Routes, rr)
+					case *dag.RegexRoute:
+						rr := route.Route{
+							Match:               envoy.RouteRegex(r.Regex),
+							Action:              envoy.RouteRoute(&r.Route),
+							RequestHeadersToAdd: envoy.RouteHeaders(),
+						}
+
+						if r.HTTPSUpgrade {
+							rr.Action = envoy.UpgradeHTTPS()
+							rr.RequestHeadersToAdd = nil
+						}
+						vhost.Routes = append(vhost.Routes, rr)
 					}
 				})
-				if len(svcs) < 1 {
-					// no services for this route, skip it.
+				if len(vhost.Routes) < 1 {
 					return
 				}
-				vhost.Routes = append(vhost.Routes, route.Route{
-					Match:  envoy.PrefixMatch(r.Prefix),
-					Action: envoy.RouteRoute(r, svcs),
+				sort.Stable(longestRouteFirst(vhost.Routes))
+				v.routes["ingress_http"].VirtualHosts = append(v.routes["ingress_http"].VirtualHosts, vhost)
+			case *dag.SecureVirtualHost:
+				vhost := envoy.VirtualHost(vh.VirtualHost.Name)
+				vh.Visit(func(v dag.Vertex) {
+					switch r := v.(type) {
+					case *dag.PrefixRoute:
+						vhost.Routes = append(vhost.Routes, route.Route{
+							Match:               envoy.RoutePrefix(r.Prefix),
+							Action:              envoy.RouteRoute(&r.Route),
+							RequestHeadersToAdd: envoy.RouteHeaders(),
+						})
+					case *dag.RegexRoute:
+						vhost.Routes = append(vhost.Routes, route.Route{
+							Match:               envoy.RouteRegex(r.Regex),
+							Action:              envoy.RouteRoute(&r.Route),
+							RequestHeadersToAdd: envoy.RouteHeaders(),
+						})
+
+					}
 				})
+				if len(vhost.Routes) < 1 {
+					return
+				}
+				sort.Stable(longestRouteFirst(vhost.Routes))
+				v.routes["ingress_https"].VirtualHosts = append(v.routes["ingress_https"].VirtualHosts, vhost)
+			default:
+				// recurse
+				vertex.Visit(v.visit)
 			}
 		})
-		if len(vhost.Routes) < 1 {
-			return
-		}
-		sort.Stable(sort.Reverse(longestRouteFirst(vhost.Routes)))
-		v.routes["ingress_https"].VirtualHosts = append(v.routes["ingress_https"].VirtualHosts, vhost)
 	default:
 		// recurse
 		vertex.Visit(v.visit)
@@ -183,30 +220,21 @@ type longestRouteFirst []route.Route
 func (l longestRouteFirst) Len() int      { return len(l) }
 func (l longestRouteFirst) Swap(i, j int) { l[i], l[j] = l[j], l[i] }
 func (l longestRouteFirst) Less(i, j int) bool {
-	a, ok := l[i].Match.PathSpecifier.(*route.RouteMatch_Prefix)
-	if !ok {
-		// ignore non prefix matches
-		return false
+	switch a := l[i].Match.PathSpecifier.(type) {
+	case *route.RouteMatch_Prefix:
+		switch b := l[j].Match.PathSpecifier.(type) {
+		case *route.RouteMatch_Prefix:
+			return a.Prefix > b.Prefix
+		}
+	case *route.RouteMatch_Regex:
+		switch b := l[j].Match.PathSpecifier.(type) {
+		case *route.RouteMatch_Regex:
+			return a.Regex > b.Regex
+		case *route.RouteMatch_Prefix:
+			return true
+		}
 	}
-
-	b, ok := l[j].Match.PathSpecifier.(*route.RouteMatch_Prefix)
-	if !ok {
-		// ignore non prefix matches
-		return false
-	}
-
-	return a.Prefix < b.Prefix
+	return false
 }
 
 func u32(val int) *types.UInt32Value { return &types.UInt32Value{Value: uint32(val)} }
-
-var bvTrue = types.BoolValue{Value: true}
-
-// bv returns a pointer to a true types.BoolValue if val is true,
-// otherwise it returns nil.
-func bv(val bool) *types.BoolValue {
-	if val {
-		return &bvTrue
-	}
-	return nil
-}

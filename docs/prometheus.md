@@ -1,6 +1,8 @@
 # Prometheus
 
-Contour and Envoy expose metrics that can be scraped with Prometheus.
+Contour and Envoy expose metrics that can be scraped with Prometheus. By
+default, annotations to gather them are in all the `deployment` yamls and they
+should work out of the box with most configurations.
 
 ## Envoy Metrics
 
@@ -9,63 +11,13 @@ avoid exposing the entire admin interface to Prometheus (and other workloads in
 the cluster), Contour configures a static listener that sends traffic to the
 stats endpoint and nowhere else.
 
-To enable the static listener, set the `--statsd-enabled` flag.
-By default, Envoy's stats will be exposed over `0.0.0.0:8002` but can be overridden setting the `--stats-address` and `--stats-port` flags in Contour.
-
-### Configuration Prometheus
-
-The Envoy stats endpoint returns the metrics in statsd format by default. To get
-the metrics in Prometheus format, requests to the endpoint must be made with a
-URL parameter: `format=prometheus` ([This requirement will go away in a newer
-version of Envoy](https://github.com/envoyproxy/envoy/issues/2182)).
-
-Because of this Envoy requirement, the Prometheus scraping configuration must be
-tweaked to include the following:
-
-```yaml
-- source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_format]
-  action: replace
-  target_label: __param_format
-  regex: (.+)
-```
-
-The following is the official Prometheus Kubernetes example configuration, with
-the addition of the tweak mentioned above:
-
-```yaml
-    - job_name: 'kubernetes-pods'
-      kubernetes_sd_configs:
-      - role: pod
-      relabel_configs:
-      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
-        action: keep
-        regex: true
-      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
-        action: replace
-        target_label: __metrics_path__
-        regex: (.+)
-      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_format]
-        action: replace
-        target_label: __param_format
-        regex: (.+)
-      - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
-        action: replace
-        regex: ([^:]+)(?::\d+)?;(\d+)
-        replacement: $1:$2
-        target_label: __address__
-      - action: labelmap
-        regex: __meta_kubernetes_pod_label_(.+)
-      - source_labels: [__meta_kubernetes_namespace]
-        action: replace
-        target_label: kubernetes_namespace
-      - source_labels: [__meta_kubernetes_pod_name]
-        action: replace
-        target_label: kubernetes_pod_name
-```
+Envoy supports Prometheus-compatible `/stats/prometheus` endpoint for metrics on
+port `8002`.
 
 ## Contour Metrics
 
-Contour exposes a Prometheus-compatible `/metrics` endpoint with the following metrics:
+Contour exposes a Prometheus-compatible `/metrics` endpoint on port `8000` with
+the following metrics:
 
 - **contour_ingressroute_total (gauge):** Total number of IngressRoutes objects that exist regardless of status (i.e. Valid / Invalid / Orphaned, etc). This metric should match the sum of `Orphaned` + `Valid` + `Invalid` IngressRoutes.
   - namespace
@@ -80,3 +32,65 @@ Contour exposes a Prometheus-compatible `/metrics` endpoint with the following m
   - namespace
   - vhost
 - **contour_ingressroute_dagrebuild_timestamp (gauge):** Timestamp of the last DAG rebuild
+
+## Sample Deployment
+
+In the `/examples` directory there are example deployment files that can be used to spin up an example environment.
+All deployments there are configured with annotations for prometheus to scrape by default, so it should be possible to utilize any of them with the following quickstart example instructions.
+
+### Deploy Prometheus
+
+A sample deployment of Prometheus and Alertmanager is provided that uses temporary storage. This deployment can be used for testing and development, but might not be suitable for all environments.
+
+#### Stateful Deployment
+
+ A stateful deployment of Prometheus should use persistent storage with [Persistent Volumes and Persistent Volume Claims](https://kubernetes.io/docs/concepts/storage/persistent-volumes/) to maintain a correlation between a data volume and the Prometheus Pod. 
+ Persistent volumes can be static or dynamic and depends on the backend storage implementation utilized in environment in which the cluster is deployed. For more information, see the [Kubernetes documentation on types of persistent volumes](https://kubernetes.io/docs/concepts/storage/persistent-volumes/#types-of-persistent-volumes).
+
+#### Quick start
+
+```sh
+# Deploy 
+$ kubectl apply -f examples/prometheus
+```
+
+#### Access the Prometheus web UI
+
+```sh
+$ kubectl -n contour-monitoring port-forward $(kubectl -n contour-monitoring get pods -l app=prometheus -l component=server -o jsonpath='{.items[0].metadata.name}') 9090:9090
+```
+
+then go to [http://localhost:9090](http://localhost:9090) in your browser.
+
+#### Access the Alertmanager web UI
+
+```sh
+$ kubectl -n contour-monitoring port-forward $(kubectl -n contour-monitoring get pods -l app=prometheus -l component=alertmanager -o jsonpath='{.items[0].metadata.name}') 9093:9093
+```
+
+then go to [http://localhost:9093](http://localhost:9093) in your browser.
+
+### Deploy Grafana
+
+A sample deployment of Grafana is provided that uses temporary storage.
+
+#### Quick start
+
+```sh
+# Deploy
+$ kubectl apply -f examples/grafana/
+
+# Create secret with grafana credentials
+$ kubectl create secret generic grafana -n contour-monitoring \
+    --from-literal=grafana-admin-password=admin \
+    --from-literal=grafana-admin-user=admin
+```
+
+#### Access the Grafana UI
+
+```sh
+$ kubectl port-forward $(kubectl get pods -l app=grafana -n contour-monitoring -o jsonpath='{.items[0].metadata.name}') 3000 -n contour-monitoring
+```
+
+then go to [http://localhost:3000](http://localhost:3000) in your browser.
+The username and password are from when you defined the Grafana secret in the previous step.

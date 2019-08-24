@@ -14,24 +14,112 @@
 package envoy
 
 import (
-	"bytes"
 	"testing"
+	"time"
 
+	v2 "github.com/envoyproxy/go-control-plane/envoy/api/v2"
 	"github.com/envoyproxy/go-control-plane/envoy/api/v2/auth"
 	"github.com/envoyproxy/go-control-plane/envoy/api/v2/core"
 	"github.com/envoyproxy/go-control-plane/envoy/api/v2/listener"
-	accesslog_v2 "github.com/envoyproxy/go-control-plane/envoy/config/accesslog/v2"
-	envoy_accesslog "github.com/envoyproxy/go-control-plane/envoy/config/filter/accesslog/v2"
+	http "github.com/envoyproxy/go-control-plane/envoy/config/filter/network/http_connection_manager/v2"
 	envoy_config_v2_tcpproxy "github.com/envoyproxy/go-control-plane/envoy/config/filter/network/tcp_proxy/v2"
 	"github.com/envoyproxy/go-control-plane/pkg/util"
-	"github.com/gogo/protobuf/jsonpb"
-	"github.com/gogo/protobuf/proto"
 	"github.com/gogo/protobuf/types"
 	"github.com/google/go-cmp/cmp"
 	"github.com/heptio/contour/internal/dag"
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 )
+
+func TestListener(t *testing.T) {
+	tests := map[string]struct {
+		name, address string
+		port          int
+		lf            []listener.ListenerFilter
+		f             []listener.Filter
+		want          *v2.Listener
+	}{
+		"insecure listener": {
+			name:    "http",
+			address: "0.0.0.0",
+			port:    9000,
+			f:       []listener.Filter{HTTPConnectionManager("http", "/dev/null")},
+			want: &v2.Listener{
+				Name:    "http",
+				Address: *SocketAddress("0.0.0.0", 9000),
+				FilterChains: []listener.FilterChain{{
+					Filters: []listener.Filter{
+						HTTPConnectionManager("http", "/dev/null"),
+					},
+				}},
+			},
+		},
+		"insecure listener w/ proxy": {
+			name:    "http-proxy",
+			address: "0.0.0.0",
+			port:    9000,
+			lf: []listener.ListenerFilter{
+				ProxyProtocol(),
+			},
+			f: []listener.Filter{
+				HTTPConnectionManager("http-proxy", "/dev/null"),
+			},
+			want: &v2.Listener{
+				Name:    "http-proxy",
+				Address: *SocketAddress("0.0.0.0", 9000),
+				ListenerFilters: []listener.ListenerFilter{
+					ProxyProtocol(),
+				},
+				FilterChains: []listener.FilterChain{{
+					Filters: []listener.Filter{
+						HTTPConnectionManager("http-proxy", "/dev/null"),
+					},
+				}},
+			},
+		},
+		"secure listener": {
+			name:    "https",
+			address: "0.0.0.0",
+			port:    9000,
+			lf: []listener.ListenerFilter{
+				TLSInspector(),
+			},
+			want: &v2.Listener{
+				Name:    "https",
+				Address: *SocketAddress("0.0.0.0", 9000),
+				ListenerFilters: []listener.ListenerFilter{
+					TLSInspector(),
+				},
+			},
+		},
+		"secure listener w/ proxy": {
+			name:    "https-proxy",
+			address: "0.0.0.0",
+			port:    9000,
+			lf: []listener.ListenerFilter{
+				ProxyProtocol(),
+				TLSInspector(),
+			},
+			want: &v2.Listener{
+				Name:    "https-proxy",
+				Address: *SocketAddress("0.0.0.0", 9000),
+				ListenerFilters: []listener.ListenerFilter{
+					ProxyProtocol(),
+					TLSInspector(),
+				},
+			},
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			got := Listener(tc.name, tc.address, tc.port, tc.lf, tc.f...)
+			if diff := cmp.Diff(tc.want, got); diff != "" {
+				t.Fatal(diff)
+			}
+		})
+	}
+}
 
 func TestSocketAddress(t *testing.T) {
 	const (
@@ -40,7 +128,7 @@ func TestSocketAddress(t *testing.T) {
 	)
 
 	got := SocketAddress(addr, port)
-	want := core.Address{
+	want := &core.Address{
 		Address: &core.Address_SocketAddress{
 			SocketAddress: &core.SocketAddress{
 				Protocol: core.TCP,
@@ -54,29 +142,59 @@ func TestSocketAddress(t *testing.T) {
 	if diff := cmp.Diff(want, got); diff != "" {
 		t.Fatal(diff)
 	}
+
+	got = SocketAddress("::", port)
+	want = &core.Address{
+		Address: &core.Address_SocketAddress{
+			SocketAddress: &core.SocketAddress{
+				Protocol:   core.TCP,
+				Address:    "::",
+				Ipv4Compat: true, // Set only for ipv6-any "::"
+				PortSpecifier: &core.SocketAddress_PortValue{
+					PortValue: port,
+				},
+			},
+		},
+	}
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Fatal(diff)
+	}
 }
 
 func TestDownstreamTLSContext(t *testing.T) {
-	const (
-		cert = "foo"
-		key  = "secret"
-	)
-	got := DownstreamTLSContext([]byte(cert), []byte(key), auth.TlsParameters_TLSv1_1, "h2", "http/1.1")
+	const secretName = "default/tls-cert"
+
+	got := DownstreamTLSContext(secretName, auth.TlsParameters_TLSv1_1, "h2", "http/1.1")
 	want := &auth.DownstreamTlsContext{
 		CommonTlsContext: &auth.CommonTlsContext{
 			TlsParams: &auth.TlsParameters{
 				TlsMinimumProtocolVersion: auth.TlsParameters_TLSv1_1,
 				TlsMaximumProtocolVersion: auth.TlsParameters_TLSv1_3,
-			},
-			TlsCertificates: []*auth.TlsCertificate{{
-				CertificateChain: &core.DataSource{
-					Specifier: &core.DataSource_InlineBytes{
-						InlineBytes: []byte(cert),
-					},
+				CipherSuites: []string{
+					"[ECDHE-ECDSA-AES128-GCM-SHA256|ECDHE-ECDSA-CHACHA20-POLY1305]",
+					"[ECDHE-RSA-AES128-GCM-SHA256|ECDHE-RSA-CHACHA20-POLY1305]",
+					"ECDHE-ECDSA-AES128-SHA",
+					"ECDHE-RSA-AES128-SHA",
+					"ECDHE-ECDSA-AES256-GCM-SHA384",
+					"ECDHE-RSA-AES256-GCM-SHA384",
+					"ECDHE-ECDSA-AES256-SHA",
+					"ECDHE-RSA-AES256-SHA",
 				},
-				PrivateKey: &core.DataSource{
-					Specifier: &core.DataSource_InlineBytes{
-						InlineBytes: []byte(key),
+			},
+			TlsCertificateSdsSecretConfigs: []*auth.SdsSecretConfig{{
+				Name: secretName,
+				SdsConfig: &core.ConfigSource{
+					ConfigSourceSpecifier: &core.ConfigSource_ApiConfigSource{
+						ApiConfigSource: &core.ApiConfigSource{
+							ApiType: core.ApiConfigSource_GRPC,
+							GrpcServices: []*core.GrpcService{{
+								TargetSpecifier: &core.GrpcService_EnvoyGrpc_{
+									EnvoyGrpc: &core.GrpcService_EnvoyGrpc{
+										ClusterName: "contour",
+									},
+								},
+							}},
+						},
 					},
 				},
 			}},
@@ -88,28 +206,99 @@ func TestDownstreamTLSContext(t *testing.T) {
 	}
 }
 
+func TestHTTPConnectionManager(t *testing.T) {
+	duration := func(d time.Duration) *time.Duration {
+		return &d
+	}
+	tests := map[string]struct {
+		routename string
+		accesslog string
+		want      listener.Filter
+	}{
+		"default": {
+			routename: "default/kuard",
+			accesslog: "/dev/stdout",
+			want: listener.Filter{
+				Name: util.HTTPConnectionManager,
+				ConfigType: &listener.Filter_TypedConfig{
+					TypedConfig: any(&http.HttpConnectionManager{
+						StatPrefix: "default/kuard",
+						RouteSpecifier: &http.HttpConnectionManager_Rds{
+							Rds: &http.Rds{
+								RouteConfigName: "default/kuard",
+								ConfigSource: core.ConfigSource{
+									ConfigSourceSpecifier: &core.ConfigSource_ApiConfigSource{
+										ApiConfigSource: &core.ApiConfigSource{
+											ApiType: core.ApiConfigSource_GRPC,
+											GrpcServices: []*core.GrpcService{{
+												TargetSpecifier: &core.GrpcService_EnvoyGrpc_{
+													EnvoyGrpc: &core.GrpcService_EnvoyGrpc{
+														ClusterName: "contour",
+													},
+												},
+											}},
+										},
+									},
+								},
+							},
+						},
+						HttpFilters: []*http.HttpFilter{{
+							Name: util.Gzip,
+						}, {
+							Name: util.GRPCWeb,
+						}, {
+							Name: util.Router,
+						}},
+						HttpProtocolOptions: &core.Http1ProtocolOptions{
+							// Enable support for HTTP/1.0 requests that carry
+							// a Host: header. See #537.
+							AcceptHttp_10: true,
+						},
+						AccessLog:        FileAccessLog("/dev/stdout"),
+						UseRemoteAddress: &types.BoolValue{Value: true},
+						NormalizePath:    &types.BoolValue{Value: true},
+						IdleTimeout:      duration(HTTPDefaultIdleTimeout),
+					}),
+				},
+			},
+		},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			got := HTTPConnectionManager(tc.routename, tc.accesslog)
+			if diff := cmp.Diff(tc.want, got); diff != "" {
+				t.Fatal(diff)
+			}
+		})
+	}
+}
+
 func TestTCPProxy(t *testing.T) {
 	const (
 		statPrefix    = "ingress_https"
 		accessLogPath = "/dev/stdout"
 	)
 
-	s1 := &dag.TCPService{
-		Name:      "example",
-		Namespace: "default",
-		ServicePort: &v1.ServicePort{
-			Protocol:   "TCP",
-			Port:       443,
-			TargetPort: intstr.FromInt(8443),
+	c1 := &dag.Cluster{
+		Upstream: &dag.TCPService{
+			Name:      "example",
+			Namespace: "default",
+			ServicePort: &v1.ServicePort{
+				Protocol:   "TCP",
+				Port:       443,
+				TargetPort: intstr.FromInt(8443),
+			},
 		},
 	}
-	s2 := &dag.TCPService{
-		Name:      "example2",
-		Namespace: "default",
-		ServicePort: &v1.ServicePort{
-			Protocol:   "TCP",
-			Port:       443,
-			TargetPort: intstr.FromInt(8443),
+	c2 := &dag.Cluster{
+		Upstream: &dag.TCPService{
+			Name:      "example2",
+			Namespace: "default",
+			ServicePort: &v1.ServicePort{
+				Protocol:   "TCP",
+				Port:       443,
+				TargetPort: intstr.FromInt(8443),
+			},
 		},
 		Weight: 20,
 	}
@@ -120,50 +309,46 @@ func TestTCPProxy(t *testing.T) {
 	}{
 		"single cluster": {
 			proxy: &dag.TCPProxy{
-				Services: []*dag.TCPService{
-					s1,
-				},
+				Clusters: []*dag.Cluster{c1},
 			},
 			want: listener.Filter{
 				Name: util.TCPProxy,
-				Config: messageToStruct(&envoy_config_v2_tcpproxy.TcpProxy{
-					StatPrefix: statPrefix,
-					ClusterSpecifier: &envoy_config_v2_tcpproxy.TcpProxy_Cluster{
-						Cluster: Clustername(s1),
-					},
-					AccessLog: []*envoy_accesslog.AccessLog{{
-						Name:   util.FileAccessLog,
-						Config: messageToStruct(fileAccessLog(accessLogPath)),
-					}},
-				}),
+				ConfigType: &listener.Filter_TypedConfig{
+					TypedConfig: any(&envoy_config_v2_tcpproxy.TcpProxy{
+						StatPrefix: statPrefix,
+						ClusterSpecifier: &envoy_config_v2_tcpproxy.TcpProxy_Cluster{
+							Cluster: Clustername(c1),
+						},
+						AccessLog:   FileAccessLog(accessLogPath),
+						IdleTimeout: idleTimeout(TCPDefaultIdleTimeout),
+					}),
+				},
 			},
 		},
 		"multiple cluster": {
 			proxy: &dag.TCPProxy{
-				Services: []*dag.TCPService{
-					s2, s1, // assert that these are sorted
-				},
+				Clusters: []*dag.Cluster{c2, c1},
 			},
 			want: listener.Filter{
 				Name: util.TCPProxy,
-				Config: messageToStruct(&envoy_config_v2_tcpproxy.TcpProxy{
-					StatPrefix: statPrefix,
-					ClusterSpecifier: &envoy_config_v2_tcpproxy.TcpProxy_WeightedClusters{
-						WeightedClusters: &envoy_config_v2_tcpproxy.TcpProxy_WeightedCluster{
-							Clusters: []*envoy_config_v2_tcpproxy.TcpProxy_WeightedCluster_ClusterWeight{{
-								Name:   Clustername(s1),
-								Weight: 1,
-							}, {
-								Name:   Clustername(s2),
-								Weight: 20,
-							}},
+				ConfigType: &listener.Filter_TypedConfig{
+					TypedConfig: any(&envoy_config_v2_tcpproxy.TcpProxy{
+						StatPrefix: statPrefix,
+						ClusterSpecifier: &envoy_config_v2_tcpproxy.TcpProxy_WeightedClusters{
+							WeightedClusters: &envoy_config_v2_tcpproxy.TcpProxy_WeightedCluster{
+								Clusters: []*envoy_config_v2_tcpproxy.TcpProxy_WeightedCluster_ClusterWeight{{
+									Name:   Clustername(c1),
+									Weight: 1,
+								}, {
+									Name:   Clustername(c2),
+									Weight: 20,
+								}},
+							},
 						},
-					},
-					AccessLog: []*envoy_accesslog.AccessLog{{
-						Name:   util.FileAccessLog,
-						Config: messageToStruct(fileAccessLog(accessLogPath)),
-					}},
-				}),
+						AccessLog:   FileAccessLog(accessLogPath),
+						IdleTimeout: idleTimeout(TCPDefaultIdleTimeout),
+					}),
+				},
 			},
 		},
 	}
@@ -175,28 +360,5 @@ func TestTCPProxy(t *testing.T) {
 				t.Fatal(diff)
 			}
 		})
-	}
-}
-
-// messageToStruct encodes a protobuf Message into a Struct.
-// Hilariously, it uses JSON as the intermediary.
-// author:glen@turbinelabs.io
-func messageToStruct(msg proto.Message) *types.Struct {
-	buf := &bytes.Buffer{}
-	if err := (&jsonpb.Marshaler{OrigName: true}).Marshal(buf, msg); err != nil {
-		panic(err)
-	}
-
-	pbs := &types.Struct{}
-	if err := jsonpb.Unmarshal(buf, pbs); err != nil {
-		panic(err)
-	}
-
-	return pbs
-}
-
-func fileAccessLog(path string) *accesslog_v2.FileAccessLog {
-	return &accesslog_v2.FileAccessLog{
-		Path: path,
 	}
 }

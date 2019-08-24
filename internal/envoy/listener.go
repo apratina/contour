@@ -15,21 +15,69 @@ package envoy
 
 import (
 	"sort"
+	"time"
 
+	v2 "github.com/envoyproxy/go-control-plane/envoy/api/v2"
 	"github.com/envoyproxy/go-control-plane/envoy/api/v2/auth"
 	"github.com/envoyproxy/go-control-plane/envoy/api/v2/core"
 	"github.com/envoyproxy/go-control-plane/envoy/api/v2/listener"
+	http "github.com/envoyproxy/go-control-plane/envoy/config/filter/network/http_connection_manager/v2"
+	tcp "github.com/envoyproxy/go-control-plane/envoy/config/filter/network/tcp_proxy/v2"
 	"github.com/envoyproxy/go-control-plane/pkg/util"
+	"github.com/gogo/protobuf/proto"
 	"github.com/gogo/protobuf/types"
 	"github.com/heptio/contour/internal/dag"
 )
 
+// HTTPDefaultIdleTimeout sets the idle timeout for HTTP connections
+// to 60 seconds. This is chosen as a rough default to stop idle connections
+// wasting resources, without stopping slow connections from being terminated
+// too quickly.
+// Exported so the same value can be used here and in e2e tests.
+const HTTPDefaultIdleTimeout = 60 * time.Second
+
+// TCPDefaultIdleTimeout sets the idle timeout in seconds for
+// connections through a TCP Proxy type filter.
+// It's defaulted to two and a half hours for reasons documented at
+// https://github.com/heptio/contour/issues/1074
+// Set to 9001 because now it's OVER NINE THOUSAND.
+// Exported so the same value can be used here and in e2e tests.
+const TCPDefaultIdleTimeout = 9001 * time.Second
+
 // TLSInspector returns a new TLS inspector listener filter.
 func TLSInspector() listener.ListenerFilter {
 	return listener.ListenerFilter{
-		Name:   util.TlsInspector,
-		Config: new(types.Struct),
+		Name: util.TlsInspector,
 	}
+}
+
+// ProxyProtocol returns a new Proxy Protocol listener filter.
+func ProxyProtocol() listener.ListenerFilter {
+	return listener.ListenerFilter{
+		Name: util.ProxyProtocol,
+	}
+}
+
+// Listener returns a new v2.Listener for the supplied address, port, and filters.
+func Listener(name, address string, port int, lf []listener.ListenerFilter, filters ...listener.Filter) *v2.Listener {
+	l := &v2.Listener{
+		Name:            name,
+		Address:         *SocketAddress(address, port),
+		ListenerFilters: lf,
+	}
+	if len(filters) > 0 {
+		l.FilterChains = append(
+			l.FilterChains,
+			listener.FilterChain{
+				Filters: filters,
+			},
+		)
+	}
+	return l
+}
+
+func idleTimeout(d time.Duration) *time.Duration {
+	return &d
 }
 
 // HTTPConnectionManager creates a new HTTP Connection Manager filter
@@ -37,105 +85,126 @@ func TLSInspector() listener.ListenerFilter {
 func HTTPConnectionManager(routename, accessLogPath string) listener.Filter {
 	return listener.Filter{
 		Name: util.HTTPConnectionManager,
-		Config: &types.Struct{
-			Fields: map[string]*types.Value{
-				"stat_prefix": sv(routename),
-				"rds": st(map[string]*types.Value{
-					"route_config_name": sv(routename),
-					"config_source": st(map[string]*types.Value{
-						"api_config_source": st(map[string]*types.Value{
-							"api_type": sv("GRPC"),
-							"grpc_services": lv(
-								st(map[string]*types.Value{
-									"envoy_grpc": st(map[string]*types.Value{
-										"cluster_name": sv("contour"),
-									}),
-								}),
-							),
-						}),
-					}),
-				}),
-				"http_filters": lv(
-					st(map[string]*types.Value{
-						"name": sv(util.Gzip),
-					}),
-					st(map[string]*types.Value{
-						"name": sv(util.GRPCWeb),
-					}),
-					st(map[string]*types.Value{
-						"name": sv(util.Router),
-					}),
-				),
-				"http_protocol_options": st(map[string]*types.Value{
-					"accept_http_10": {Kind: &types.Value_BoolValue{BoolValue: true}},
-				}),
-				"access_log":         accesslog(accessLogPath),
-				"use_remote_address": {Kind: &types.Value_BoolValue{BoolValue: true}}, // TODO(jbeda) should this ever be false?
-			},
+		ConfigType: &listener.Filter_TypedConfig{
+			TypedConfig: any(&http.HttpConnectionManager{
+				StatPrefix: routename,
+				RouteSpecifier: &http.HttpConnectionManager_Rds{
+					Rds: &http.Rds{
+						RouteConfigName: routename,
+						ConfigSource: core.ConfigSource{
+							ConfigSourceSpecifier: &core.ConfigSource_ApiConfigSource{
+								ApiConfigSource: &core.ApiConfigSource{
+									ApiType: core.ApiConfigSource_GRPC,
+									GrpcServices: []*core.GrpcService{{
+										TargetSpecifier: &core.GrpcService_EnvoyGrpc_{
+											EnvoyGrpc: &core.GrpcService_EnvoyGrpc{
+												ClusterName: "contour",
+											},
+										},
+									}},
+								},
+							},
+						},
+					},
+				},
+				HttpFilters: []*http.HttpFilter{{
+					Name: util.Gzip,
+				}, {
+					Name: util.GRPCWeb,
+				}, {
+					Name: util.Router,
+				}},
+				HttpProtocolOptions: &core.Http1ProtocolOptions{
+					// Enable support for HTTP/1.0 requests that carry
+					// a Host: header. See #537.
+					AcceptHttp_10: true,
+				},
+				AccessLog:        FileAccessLog(accessLogPath),
+				UseRemoteAddress: &types.BoolValue{Value: true}, // TODO(jbeda) should this ever be false?
+				NormalizePath:    &types.BoolValue{Value: true},
+				IdleTimeout:      idleTimeout(HTTPDefaultIdleTimeout),
+			}),
 		},
 	}
 }
 
 // TCPProxy creates a new TCPProxy filter.
 func TCPProxy(statPrefix string, proxy *dag.TCPProxy, accessLogPath string) listener.Filter {
-	switch len(proxy.Services) {
+	tcpIdleTimeout := idleTimeout(TCPDefaultIdleTimeout)
+	switch len(proxy.Clusters) {
 	case 1:
 		return listener.Filter{
 			Name: util.TCPProxy,
-			Config: &types.Struct{
-				Fields: map[string]*types.Value{
-					"stat_prefix": sv(statPrefix),
-					"cluster":     sv(Clustername(proxy.Services[0])),
-					"access_log":  accesslog(accessLogPath),
-				},
+			ConfigType: &listener.Filter_TypedConfig{
+				TypedConfig: any(&tcp.TcpProxy{
+					StatPrefix: statPrefix,
+					ClusterSpecifier: &tcp.TcpProxy_Cluster{
+						Cluster: Clustername(proxy.Clusters[0]),
+					},
+					AccessLog:   FileAccessLog(accessLogPath),
+					IdleTimeout: tcpIdleTimeout,
+				}),
 			},
 		}
 	default:
-		// its easier to sort the input of the cluster list rather than the
-		// grpc type output. We have to make a copy to avoid mutating the dag.
-		services := make([]*dag.TCPService, len(proxy.Services))
-		copy(services, proxy.Services)
-		sort.Stable(tcpServiceByName(services))
-		var l []*types.Value
-		for _, service := range services {
-			weight := service.Weight
+		var clusters []*tcp.TcpProxy_WeightedCluster_ClusterWeight
+		for _, c := range proxy.Clusters {
+			weight := uint32(c.Weight)
 			if weight == 0 {
 				weight = 1
 			}
-			l = append(l, st(map[string]*types.Value{
-				"name":   sv(Clustername(service)),
-				"weight": nv(float64(weight)),
-			}))
+			clusters = append(clusters, &tcp.TcpProxy_WeightedCluster_ClusterWeight{
+				Name:   Clustername(c),
+				Weight: weight,
+			})
 		}
+		sort.Stable(clustersByNameAndWeight(clusters))
 		return listener.Filter{
 			Name: util.TCPProxy,
-			Config: &types.Struct{
-				Fields: map[string]*types.Value{
-					"stat_prefix": sv(statPrefix),
-					"weighted_clusters": st(map[string]*types.Value{
-						"clusters": lv(l...),
-					}),
-					"access_log": accesslog(accessLogPath),
-				},
+			ConfigType: &listener.Filter_TypedConfig{
+				TypedConfig: any(&tcp.TcpProxy{
+					StatPrefix: statPrefix,
+					ClusterSpecifier: &tcp.TcpProxy_WeightedClusters{
+						WeightedClusters: &tcp.TcpProxy_WeightedCluster{
+							Clusters: clusters,
+						},
+					},
+					AccessLog:   FileAccessLog(accessLogPath),
+					IdleTimeout: tcpIdleTimeout,
+				}),
 			},
 		}
 	}
 }
 
-type tcpServiceByName []*dag.TCPService
+type clustersByNameAndWeight []*tcp.TcpProxy_WeightedCluster_ClusterWeight
 
-func (t tcpServiceByName) Len() int      { return len(t) }
-func (t tcpServiceByName) Swap(i, j int) { t[i], t[j] = t[j], t[i] }
-func (t tcpServiceByName) Less(i, j int) bool {
-	if t[i].Name == t[j].Name {
-		return t[i].Weight < t[j].Weight
+func (c clustersByNameAndWeight) Len() int      { return len(c) }
+func (c clustersByNameAndWeight) Swap(i, j int) { c[i], c[j] = c[j], c[i] }
+func (c clustersByNameAndWeight) Less(i, j int) bool {
+	if c[i].Name == c[j].Name {
+		return c[i].Weight < c[j].Weight
 	}
-	return t[i].Name < t[j].Name
+	return c[i].Name < c[j].Name
 }
 
 // SocketAddress creates a new TCP core.Address.
-func SocketAddress(address string, port int) core.Address {
-	return core.Address{
+func SocketAddress(address string, port int) *core.Address {
+	if address == "::" {
+		return &core.Address{
+			Address: &core.Address_SocketAddress{
+				SocketAddress: &core.SocketAddress{
+					Protocol:   core.TCP,
+					Address:    address,
+					Ipv4Compat: true,
+					PortSpecifier: &core.SocketAddress_PortValue{
+						PortValue: uint32(port),
+					},
+				},
+			},
+		}
+	}
+	return &core.Address{
 		Address: &core.Address_SocketAddress{
 			SocketAddress: &core.SocketAddress{
 				Protocol: core.TCP,
@@ -148,54 +217,43 @@ func SocketAddress(address string, port int) core.Address {
 	}
 }
 
-// DownstreamTLSContext creates a new DownstreamTlsContext.
-func DownstreamTLSContext(cert, key []byte, tlsMinProtoVersion auth.TlsParameters_TlsProtocol, alpnProtos ...string) *auth.DownstreamTlsContext {
-	return &auth.DownstreamTlsContext{
-		CommonTlsContext: &auth.CommonTlsContext{
-			TlsParams: &auth.TlsParameters{
-				TlsMinimumProtocolVersion: tlsMinProtoVersion,
-				TlsMaximumProtocolVersion: auth.TlsParameters_TLSv1_3,
-			},
-			TlsCertificates: []*auth.TlsCertificate{{
-				CertificateChain: &core.DataSource{
-					Specifier: &core.DataSource_InlineBytes{
-						InlineBytes: cert,
-					},
-				},
-				PrivateKey: &core.DataSource{
-					Specifier: &core.DataSource_InlineBytes{
-						InlineBytes: key,
-					},
-				},
-			}},
-			AlpnProtocols: alpnProtos,
-		},
+// Filters returns a []listener.Filter for the supplied filters.
+func Filters(filters ...listener.Filter) []listener.Filter {
+	if len(filters) == 0 {
+		return nil
 	}
+	return filters
 }
 
-func accesslog(path string) *types.Value {
-	return lv(
-		st(map[string]*types.Value{
-			"name": sv(util.FileAccessLog),
-			"config": st(map[string]*types.Value{
-				"path": sv(path),
-			}),
-		}),
-	)
+// FilterChains returns a []listener.FilterChain for the supplied filters.
+func FilterChains(filters ...listener.Filter) []listener.FilterChain {
+	if len(filters) == 0 {
+		return nil
+	}
+	return []listener.FilterChain{{
+		Filters: filters,
+	}}
 }
 
-func sv(s string) *types.Value {
-	return &types.Value{Kind: &types.Value_StringValue{StringValue: s}}
+// FilterChainTLS returns a TLS enabled listener.FilterChain,
+func FilterChainTLS(domain string, secret *dag.Secret, filters []listener.Filter, tlsMinProtoVersion auth.TlsParameters_TlsProtocol, alpnProtos ...string) listener.FilterChain {
+	fc := listener.FilterChain{
+		Filters: filters,
+	}
+	fc.FilterChainMatch = &listener.FilterChainMatch{
+		ServerNames: []string{domain},
+	}
+	// attach certificate data to this listener if provided.
+	if secret != nil {
+		fc.TlsContext = DownstreamTLSContext(Secretname(secret), tlsMinProtoVersion, alpnProtos...)
+	}
+	return fc
 }
 
-func st(m map[string]*types.Value) *types.Value {
-	return &types.Value{Kind: &types.Value_StructValue{StructValue: &types.Struct{Fields: m}}}
-}
-
-func lv(v ...*types.Value) *types.Value {
-	return &types.Value{Kind: &types.Value_ListValue{ListValue: &types.ListValue{Values: v}}}
-}
-
-func nv(n float64) *types.Value {
-	return &types.Value{Kind: &types.Value_NumberValue{NumberValue: n}}
+func any(pb proto.Message) *types.Any {
+	any, err := types.MarshalAny(pb)
+	if err != nil {
+		panic(err.Error())
+	}
+	return any
 }

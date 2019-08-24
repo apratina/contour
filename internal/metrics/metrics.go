@@ -17,6 +17,9 @@ package metrics
 import (
 	"fmt"
 	"net/http"
+	"time"
+
+	"k8s.io/client-go/kubernetes"
 
 	"github.com/heptio/contour/internal/httpsvc"
 	"github.com/prometheus/client_golang/prometheus"
@@ -143,9 +146,9 @@ func (m *Metrics) register(registry *prometheus.Registry) {
 	)
 }
 
-// SetDAGRebuiltMetric records the last time the DAG was rebuilt
-func (m *Metrics) SetDAGRebuiltMetric(timestamp int64) {
-	m.ingressRouteDAGRebuildGauge.WithLabelValues().Set(float64(timestamp))
+// SetDAGLastRebuilt records the last time the DAG was rebuilt.
+func (m *Metrics) SetDAGLastRebuilt(ts time.Time) {
+	m.ingressRouteDAGRebuildGauge.WithLabelValues().Set(float64(ts.Unix()))
 }
 
 // SetIngressRouteMetric sets metric values for a set of IngressRoutes
@@ -203,22 +206,33 @@ func (m *Metrics) SetIngressRouteMetric(metrics IngressRouteMetric) {
 type Service struct {
 	httpsvc.Service
 	*prometheus.Registry
+	Client *kubernetes.Clientset
 }
 
 // Start fulfills the g.Start contract.
 // When stop is closed the http server will shutdown.
 func (svc *Service) Start(stop <-chan struct{}) error {
-	registerHealthCheck(&svc.ServeMux)
+
+	registerHealthCheck(&svc.ServeMux, svc.Client)
 	registerMetrics(&svc.ServeMux, svc.Registry)
 
 	return svc.Service.Start(stop)
 }
 
-func registerHealthCheck(mux *http.ServeMux) {
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+func registerHealthCheck(mux *http.ServeMux, client *kubernetes.Clientset) {
+	healthCheckHandler := func(w http.ResponseWriter, r *http.Request) {
+		// Try and lookup Kubernetes server version as a quick and dirty check
+		_, err := client.ServerVersion()
+		if err != nil {
+			msg := fmt.Sprintf("Failed Kubernetes Check: %v", err)
+			http.Error(w, msg, http.StatusServiceUnavailable)
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintln(w, "OK")
-	})
+	}
+	mux.HandleFunc("/health", healthCheckHandler)
+	mux.HandleFunc("/healthz", healthCheckHandler)
 }
 
 func registerMetrics(mux *http.ServeMux, registry *prometheus.Registry) {

@@ -15,60 +15,151 @@ package contour
 
 import (
 	"reflect"
-	"sort"
 	"testing"
 
-	"github.com/envoyproxy/go-control-plane/envoy/api/v2"
-	"github.com/envoyproxy/go-control-plane/envoy/api/v2/endpoint"
+	v2 "github.com/envoyproxy/go-control-plane/envoy/api/v2"
 	"github.com/gogo/protobuf/proto"
+	"github.com/google/go-cmp/cmp"
 	"github.com/heptio/contour/internal/envoy"
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 )
 
+func TestEndpointsTranslatorContents(t *testing.T) {
+	tests := map[string]struct {
+		contents map[string]*v2.ClusterLoadAssignment
+		want     []proto.Message
+	}{
+		"empty": {
+			contents: nil,
+			want:     nil,
+		},
+		"simple": {
+			contents: clusterloadassignments(
+				envoy.ClusterLoadAssignment("default/httpbin-org",
+					envoy.SocketAddress("10.10.10.10", 80),
+				),
+			),
+			want: []proto.Message{
+				envoy.ClusterLoadAssignment("default/httpbin-org",
+					envoy.SocketAddress("10.10.10.10", 80),
+				),
+			},
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			var et EndpointsTranslator
+			et.entries = tc.contents
+			got := et.Contents()
+			if diff := cmp.Diff(tc.want, got); diff != "" {
+				t.Fatal(diff)
+			}
+		})
+	}
+}
+
+func TestEndpointCacheQuery(t *testing.T) {
+	tests := map[string]struct {
+		contents map[string]*v2.ClusterLoadAssignment
+		query    []string
+		want     []proto.Message
+	}{
+		"exact match": {
+			contents: clusterloadassignments(
+				envoy.ClusterLoadAssignment("default/httpbin-org",
+					envoy.SocketAddress("10.10.10.10", 80),
+				),
+			),
+			query: []string{"default/httpbin-org"},
+			want: []proto.Message{
+				envoy.ClusterLoadAssignment("default/httpbin-org",
+					envoy.SocketAddress("10.10.10.10", 80),
+				),
+			},
+		},
+		"partial match": {
+			contents: clusterloadassignments(
+				envoy.ClusterLoadAssignment("default/httpbin-org",
+					envoy.SocketAddress("10.10.10.10", 80),
+				),
+			),
+			query: []string{"default/kuard/8080", "default/httpbin-org"},
+			want: []proto.Message{
+				envoy.ClusterLoadAssignment("default/httpbin-org",
+					envoy.SocketAddress("10.10.10.10", 80),
+				),
+				envoy.ClusterLoadAssignment("default/kuard/8080"),
+			},
+		},
+		"no match": {
+			contents: clusterloadassignments(
+				envoy.ClusterLoadAssignment("default/httpbin-org",
+					envoy.SocketAddress("10.10.10.10", 80),
+				),
+			),
+			query: []string{"default/kuard/8080"},
+			want: []proto.Message{
+				envoy.ClusterLoadAssignment("default/kuard/8080"),
+			},
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			var et EndpointsTranslator
+			et.entries = tc.contents
+			got := et.Query(tc.query)
+			if diff := cmp.Diff(tc.want, got); diff != "" {
+				t.Fatal(diff)
+			}
+		})
+	}
+}
+
 func TestEndpointsTranslatorAddEndpoints(t *testing.T) {
-	tests := []struct {
-		name string
+	tests := map[string]struct {
 		ep   *v1.Endpoints
 		want []proto.Message
-	}{{
-		name: "simple",
-		ep: endpoints("default", "simple", v1.EndpointSubset{
-			Addresses: addresses("192.168.183.24"),
-			Ports:     ports(8080),
-		}),
-		want: []proto.Message{
-			clusterloadassignment("default/simple", envoy.LBEndpoint("192.168.183.24", 8080)),
+	}{
+		"simple": {
+			ep: endpoints("default", "simple", v1.EndpointSubset{
+				Addresses: addresses("192.168.183.24"),
+				Ports:     ports(8080),
+			}),
+			want: []proto.Message{
+				envoy.ClusterLoadAssignment("default/simple", envoy.SocketAddress("192.168.183.24", 8080)),
+			},
 		},
-	}, {
-		name: "multiple addresses",
-		ep: endpoints("default", "httpbin-org", v1.EndpointSubset{
-			Addresses: addresses(
-				"23.23.247.89",
-				"50.17.192.147",
-				"50.17.206.192",
-				"50.19.99.160",
-			),
-			Ports: ports(80),
-		}),
-		want: []proto.Message{
-			clusterloadassignment("default/httpbin-org",
-				envoy.LBEndpoint("23.23.247.89", 80),
-				envoy.LBEndpoint("50.17.192.147", 80),
-				envoy.LBEndpoint("50.17.206.192", 80),
-				envoy.LBEndpoint("50.19.99.160", 80),
-			),
+		"multiple addresses": {
+			ep: endpoints("default", "httpbin-org", v1.EndpointSubset{
+				Addresses: addresses(
+					"23.23.247.89",
+					"50.17.192.147",
+					"50.17.206.192",
+					"50.19.99.160",
+				),
+				Ports: ports(80),
+			}),
+			want: []proto.Message{
+				envoy.ClusterLoadAssignment("default/httpbin-org",
+					envoy.SocketAddress("23.23.247.89", 80),
+					envoy.SocketAddress("50.17.192.147", 80),
+					envoy.SocketAddress("50.17.206.192", 80),
+					envoy.SocketAddress("50.19.99.160", 80),
+				),
+			},
 		},
-	}}
+	}
 
 	log := testLogger(t)
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
 			et := &EndpointsTranslator{
 				FieldLogger: log,
 			}
 			et.OnAdd(tc.ep)
-			got := contents(et)
-			sort.Stable(clusterLoadAssignmentsByName(got))
+			got := et.Contents()
 			if !reflect.DeepEqual(tc.want, got) {
 				t.Fatalf("got: %v, want: %v", got, tc.want)
 			}
@@ -93,7 +184,6 @@ func TestEndpointsTranslatorRemoveEndpoints(t *testing.T) {
 				Addresses: addresses("192.168.183.24"),
 				Ports:     ports(8080),
 			}),
-			want: []proto.Message{},
 		},
 		"remove different": {
 			setup: func(et *EndpointsTranslator) {
@@ -107,7 +197,7 @@ func TestEndpointsTranslatorRemoveEndpoints(t *testing.T) {
 				Ports:     ports(8080),
 			}),
 			want: []proto.Message{
-				clusterloadassignment("default/simple", envoy.LBEndpoint("192.168.183.24", 8080)),
+				envoy.ClusterLoadAssignment("default/simple", envoy.SocketAddress("192.168.183.24", 8080)),
 			},
 		},
 		"remove non existent": {
@@ -116,7 +206,6 @@ func TestEndpointsTranslatorRemoveEndpoints(t *testing.T) {
 				Addresses: addresses("192.168.183.24"),
 				Ports:     ports(8080),
 			}),
-			want: []proto.Message{},
 		},
 		"remove long name": {
 			setup: func(et *EndpointsTranslator) {
@@ -144,7 +233,6 @@ func TestEndpointsTranslatorRemoveEndpoints(t *testing.T) {
 					Ports: ports(8000, 8443),
 				},
 			),
-			want: []proto.Message{},
 		},
 	}
 
@@ -156,10 +244,9 @@ func TestEndpointsTranslatorRemoveEndpoints(t *testing.T) {
 			}
 			tc.setup(et)
 			et.OnDelete(tc.ep)
-			got := contents(et)
-			sort.Stable(clusterLoadAssignmentsByName(got))
-			if !reflect.DeepEqual(tc.want, got) {
-				t.Fatalf("\nwant: %v\n got: %v", tc.want, got)
+			got := et.Contents()
+			if diff := cmp.Diff(tc.want, got); diff != "" {
+				t.Fatal(diff)
 			}
 		})
 	}
@@ -176,7 +263,7 @@ func TestEndpointsTranslatorRecomputeClusterLoadAssignment(t *testing.T) {
 				Ports:     ports(8080),
 			}),
 			want: []proto.Message{
-				clusterloadassignment("default/simple", envoy.LBEndpoint("192.168.183.24", 8080)),
+				envoy.ClusterLoadAssignment("default/simple", envoy.SocketAddress("192.168.183.24", 8080)),
 			},
 		},
 		"multiple addresses": {
@@ -190,11 +277,11 @@ func TestEndpointsTranslatorRecomputeClusterLoadAssignment(t *testing.T) {
 				Ports: ports(80),
 			}),
 			want: []proto.Message{
-				clusterloadassignment("default/httpbin-org",
-					envoy.LBEndpoint("23.23.247.89", 80),
-					envoy.LBEndpoint("50.17.192.147", 80),
-					envoy.LBEndpoint("50.17.206.192", 80),
-					envoy.LBEndpoint("50.19.99.160", 80),
+				envoy.ClusterLoadAssignment("default/httpbin-org",
+					envoy.SocketAddress("23.23.247.89", 80),
+					envoy.SocketAddress("50.17.192.147", 80),
+					envoy.SocketAddress("50.17.206.192", 80),
+					envoy.SocketAddress("50.19.99.160", 80),
 				),
 			},
 		},
@@ -207,7 +294,7 @@ func TestEndpointsTranslatorRecomputeClusterLoadAssignment(t *testing.T) {
 				}},
 			}),
 			want: []proto.Message{
-				clusterloadassignment("default/secure/https", envoy.LBEndpoint("192.168.183.24", 8443)),
+				envoy.ClusterLoadAssignment("default/secure/https", envoy.SocketAddress("192.168.183.24", 8443)),
 			},
 		},
 		"remove existing": {
@@ -215,17 +302,15 @@ func TestEndpointsTranslatorRecomputeClusterLoadAssignment(t *testing.T) {
 				Addresses: addresses("192.168.183.24"),
 				Ports:     ports(8080),
 			}),
-			want: []proto.Message{},
 		},
 	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
 			var et EndpointsTranslator
 			et.recomputeClusterLoadAssignment(tc.oldep, tc.newep)
-			got := contents(&et)
-			sort.Stable(clusterLoadAssignmentsByName(got))
-			if !reflect.DeepEqual(tc.want, got) {
-				t.Fatalf("expected:\n%v\ngot:\n%v", tc.want, got)
+			got := et.Contents()
+			if diff := cmp.Diff(tc.want, got); diff != "" {
+				t.Fatal(diff)
 			}
 		})
 	}
@@ -242,11 +327,12 @@ func TestEndpointsTranslatorScaleToZeroEndpoints(t *testing.T) {
 
 	// Assert endpoint was added
 	want := []proto.Message{
-		clusterloadassignment("default/simple", envoy.LBEndpoint("192.168.183.24", 8080)),
+		envoy.ClusterLoadAssignment("default/simple", envoy.SocketAddress("192.168.183.24", 8080)),
 	}
-	got := contents(&et)
-	if !reflect.DeepEqual(want, got) {
-		t.Fatalf("expected:\n%v\ngot:\n%v\n", want, got)
+	got := et.Contents()
+
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Fatal(diff)
 	}
 
 	// e2 is the same as e1, but without endpoint subsets
@@ -254,26 +340,18 @@ func TestEndpointsTranslatorScaleToZeroEndpoints(t *testing.T) {
 	et.OnUpdate(e1, e2)
 
 	// Assert endpoints are removed
-	want = []proto.Message{}
-	got = contents(&et)
-	if !reflect.DeepEqual(want, got) {
-		t.Fatalf("expected:\n%v\ngot:\n%v\n", want, got)
+	want = nil
+	got = et.Contents()
+
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Fatal(diff)
 	}
 }
 
-func clusterloadassignment(name string, lbendpoints ...endpoint.LbEndpoint) *v2.ClusterLoadAssignment {
-	return &v2.ClusterLoadAssignment{
-		ClusterName: name,
-		Endpoints: []endpoint.LocalityLbEndpoints{{
-			LbEndpoints: lbendpoints,
-		}},
+func clusterloadassignments(clas ...*v2.ClusterLoadAssignment) map[string]*v2.ClusterLoadAssignment {
+	m := make(map[string]*v2.ClusterLoadAssignment)
+	for _, cla := range clas {
+		m[cla.ClusterName] = cla
 	}
-}
-
-type clusterLoadAssignmentsByName []proto.Message
-
-func (c clusterLoadAssignmentsByName) Len() int      { return len(c) }
-func (c clusterLoadAssignmentsByName) Swap(i, j int) { c[i], c[j] = c[j], c[i] }
-func (c clusterLoadAssignmentsByName) Less(i, j int) bool {
-	return c[i].(*v2.ClusterLoadAssignment).ClusterName < c[j].(*v2.ClusterLoadAssignment).ClusterName
+	return m
 }

@@ -17,9 +17,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-	"time"
 
-	"github.com/gogo/protobuf/types"
 	"k8s.io/api/extensions/v1beta1"
 )
 
@@ -37,55 +35,13 @@ const (
 	annotationRetryOn            = "contour.heptio.com/retry-on"
 	annotationNumRetries         = "contour.heptio.com/num-retries"
 	annotationPerTryTimeout      = "contour.heptio.com/per-try-timeout"
-
-	// By default envoy applies a 15 second timeout to all backend requests.
-	// The explicit value 0 turns off the timeout, implying "never time out"
-	// https://www.envoyproxy.io/docs/envoy/v1.5.0/api-v2/rds.proto#routeaction
-	infiniteTimeout = -1
-	noTimeout       = 0
 )
-
-// parseAnnotationTimeout parses the annotations map for the supplied key as a timeout.
-// If the value is present, but malformed, the timeout value is valid, and represents
-// infinite timeout.
-func parseAnnotationTimeout(annotations map[string]string, key string) time.Duration {
-	timeoutStr := annotations[key]
-	// Error or unspecified is interpreted as no timeout specified, use envoy defaults
-	if timeoutStr == "" {
-		return noTimeout
-	}
-	// Interpret "infinity" explicitly as an infinite timeout, which envoy config
-	// expects as a timeout of 0. This could be specified with the duration string
-	// "0s" but want to give an explicit out for operators.
-	if timeoutStr == "infinity" {
-		return infiniteTimeout
-	}
-
-	timeoutParsed, err := time.ParseDuration(timeoutStr)
-	if err != nil {
-		// TODO(cmalonty) plumb a logger in here so we can log this error.
-		// Assuming infinite duration is going to surprise people less for
-		// a not-parseable duration than a implicit 15 second one.
-		return infiniteTimeout
-	}
-	return timeoutParsed
-}
 
 // parseAnnotation parses the annotation map for the supplied key.
 // If the value is not present, or malformed, then zero is returned.
 func parseAnnotation(annotations map[string]string, annotation string) int {
 	v, _ := strconv.ParseInt(annotations[annotation], 10, 32)
 	return int(v)
-}
-
-// parseAnnotationUint32 parsers the annotation map for the supplied annotation key.
-// If the value is not present, or malformed, then nil is returned.
-func parseAnnotationUInt32(annotations map[string]string, annotation string) *types.UInt32Value {
-	v, err := strconv.ParseUint(annotations[annotation], 10, 32)
-	if err != nil {
-		return nil
-	}
-	return &types.UInt32Value{Value: uint32(v)}
 }
 
 // parseUpstreamProtocols parses the annotations map for a contour.heptio.com/upstream-protocol.{protocol}
@@ -126,4 +82,23 @@ func websocketRoutes(i *v1beta1.Ingress) map[string]bool {
 		}
 	}
 	return routes
+}
+
+// getIngressClassAnnotation checks for the acceptable ingress class annotations
+// 1. contour.heptio.com/ingress.class
+// 2. kubernetes.io/ingress.class
+//
+// it returns the first matching ingress annotation (in the above order) with test
+func getIngressClassAnnotation(annotations map[string]string) string {
+	class, ok := annotations["contour.heptio.com/ingress.class"]
+	if ok {
+		return class
+	}
+
+	class, ok = annotations["kubernetes.io/ingress.class"]
+	if ok {
+		return class
+	}
+
+	return ""
 }

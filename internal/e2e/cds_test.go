@@ -18,13 +18,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/envoyproxy/go-control-plane/envoy/api/v2"
+	v2 "github.com/envoyproxy/go-control-plane/envoy/api/v2"
 	envoy_cluster "github.com/envoyproxy/go-control-plane/envoy/api/v2/cluster"
+	"github.com/envoyproxy/go-control-plane/envoy/api/v2/core"
+	endpoint "github.com/envoyproxy/go-control-plane/envoy/api/v2/endpoint"
 	"github.com/gogo/protobuf/types"
 	ingressroutev1 "github.com/heptio/contour/apis/contour/v1beta1"
 	"github.com/heptio/contour/internal/envoy"
 	"google.golang.org/grpc"
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/api/extensions/v1beta1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -62,12 +64,12 @@ func TestClusterLongServiceName(t *testing.T) {
 
 	// check that it's been translated correctly.
 	assertEqual(t, &v2.DiscoveryResponse{
-		VersionInfo: "0",
-		Resources: []types.Any{
-			any(t, cluster("default/kbujbkuh-c83ceb/8080/da39a3ee5e", "default/kbujbkuhdod66gjdmwmijz8xzgsx1nkfbrloezdjiulquzk4x3p0nnvpzi8r", "default_kbujbkuhdod66gjdmwmijz8xzgsx1nkfbrloezdjiulquzk4x3p0nnvpzi8r_8080")),
-		},
+		VersionInfo: "2",
+		Resources: resources(t,
+			cluster("default/kbujbkuh-c83ceb/8080/da39a3ee5e", "default/kbujbkuhdod66gjdmwmijz8xzgsx1nkfbrloezdjiulquzk4x3p0nnvpzi8r", "default_kbujbkuhdod66gjdmwmijz8xzgsx1nkfbrloezdjiulquzk4x3p0nnvpzi8r_8080"),
+		),
 		TypeUrl: clusterType,
-		Nonce:   "0",
+		Nonce:   "2",
 	}, streamCDS(t, cc))
 }
 
@@ -124,12 +126,12 @@ func TestClusterAddUpdateDelete(t *testing.T) {
 	rh.OnAdd(s1)
 
 	assertEqual(t, &v2.DiscoveryResponse{
-		VersionInfo: "0",
-		Resources: []types.Any{
-			any(t, cluster("default/kuard/80/da39a3ee5e", "default/kuard", "default_kuard_80")),
-		},
+		VersionInfo: "3",
+		Resources: resources(t,
+			cluster("default/kuard/80/da39a3ee5e", "default/kuard", "default_kuard_80"),
+		),
 		TypeUrl: clusterType,
-		Nonce:   "0",
+		Nonce:   "3",
 	}, streamCDS(t, cc))
 
 	// s2 is the same as s2, but the service port has a name
@@ -145,12 +147,12 @@ func TestClusterAddUpdateDelete(t *testing.T) {
 
 	// check that we get two CDS records because the port is now named.
 	assertEqual(t, &v2.DiscoveryResponse{
-		VersionInfo: "0",
-		Resources: []types.Any{
-			any(t, cluster("default/kuard/80/da39a3ee5e", "default/kuard/http", "default_kuard_80")),
-		},
+		VersionInfo: "4",
+		Resources: resources(t,
+			cluster("default/kuard/80/da39a3ee5e", "default/kuard/http", "default_kuard_80"),
+		),
 		TypeUrl: clusterType,
-		Nonce:   "0",
+		Nonce:   "4",
 	}, streamCDS(t, cc))
 
 	// s3 is like s2, but has a second named port. The k8s spec
@@ -176,13 +178,13 @@ func TestClusterAddUpdateDelete(t *testing.T) {
 	// check that we get four CDS records. Order is important
 	// because the CDS cache is sorted.
 	assertEqual(t, &v2.DiscoveryResponse{
-		VersionInfo: "0",
-		Resources: []types.Any{
-			any(t, cluster("default/kuard/443/da39a3ee5e", "default/kuard/https", "default_kuard_443")),
-			any(t, cluster("default/kuard/80/da39a3ee5e", "default/kuard/http", "default_kuard_80")),
-		},
+		VersionInfo: "5",
+		Resources: resources(t,
+			cluster("default/kuard/443/da39a3ee5e", "default/kuard/https", "default_kuard_443"),
+			cluster("default/kuard/80/da39a3ee5e", "default/kuard/http", "default_kuard_80"),
+		),
 		TypeUrl: clusterType,
-		Nonce:   "0",
+		Nonce:   "5",
 	}, streamCDS(t, cc))
 
 	// s4 is s3 with the http port removed.
@@ -201,12 +203,12 @@ func TestClusterAddUpdateDelete(t *testing.T) {
 	// check that we get two CDS records only, and that the 80 and http
 	// records have been removed even though the service object remains.
 	assertEqual(t, &v2.DiscoveryResponse{
-		VersionInfo: "0",
-		Resources: []types.Any{
-			any(t, cluster("default/kuard/443/da39a3ee5e", "default/kuard/https", "default_kuard_443")),
-		},
+		VersionInfo: "6",
+		Resources: resources(t,
+			cluster("default/kuard/443/da39a3ee5e", "default/kuard/https", "default_kuard_443"),
+		),
 		TypeUrl: clusterType,
-		Nonce:   "0",
+		Nonce:   "6",
 	}, streamCDS(t, cc))
 }
 
@@ -261,13 +263,13 @@ func TestClusterRenameUpdateDelete(t *testing.T) {
 
 	rh.OnAdd(s1)
 	assertEqual(t, &v2.DiscoveryResponse{
-		VersionInfo: "0",
-		Resources: []types.Any{
-			any(t, cluster("default/kuard/443/da39a3ee5e", "default/kuard/https", "default_kuard_443")),
-			any(t, cluster("default/kuard/80/da39a3ee5e", "default/kuard/http", "default_kuard_80")),
-		},
+		VersionInfo: "2",
+		Resources: resources(t,
+			cluster("default/kuard/443/da39a3ee5e", "default/kuard/https", "default_kuard_443"),
+			cluster("default/kuard/80/da39a3ee5e", "default/kuard/http", "default_kuard_80"),
+		),
 		TypeUrl: clusterType,
-		Nonce:   "0",
+		Nonce:   "2",
 	}, streamCDS(t, cc))
 
 	// s2 removes the name on port 80, moves it to port 443 and deletes the https port
@@ -281,33 +283,33 @@ func TestClusterRenameUpdateDelete(t *testing.T) {
 
 	rh.OnUpdate(s1, s2)
 	assertEqual(t, &v2.DiscoveryResponse{
-		VersionInfo: "0",
-		Resources: []types.Any{
-			any(t, cluster("default/kuard/443/da39a3ee5e", "default/kuard", "default_kuard_443")),
-		},
+		VersionInfo: "3",
+		Resources: resources(t,
+			cluster("default/kuard/443/da39a3ee5e", "default/kuard", "default_kuard_443"),
+		),
 		TypeUrl: clusterType,
-		Nonce:   "0",
+		Nonce:   "3",
 	}, streamCDS(t, cc))
 
 	// now replace s2 with s1 to check it works in the other direction.
 	rh.OnUpdate(s2, s1)
 	assertEqual(t, &v2.DiscoveryResponse{
-		VersionInfo: "0",
-		Resources: []types.Any{
-			any(t, cluster("default/kuard/443/da39a3ee5e", "default/kuard/https", "default_kuard_443")),
-			any(t, cluster("default/kuard/80/da39a3ee5e", "default/kuard/http", "default_kuard_80")),
-		},
+		VersionInfo: "4",
+		Resources: resources(t,
+			cluster("default/kuard/443/da39a3ee5e", "default/kuard/https", "default_kuard_443"),
+			cluster("default/kuard/80/da39a3ee5e", "default/kuard/http", "default_kuard_80"),
+		),
 		TypeUrl: clusterType,
-		Nonce:   "0",
+		Nonce:   "4",
 	}, streamCDS(t, cc))
 
 	// cleanup and check
 	rh.OnDelete(s1)
 	assertEqual(t, &v2.DiscoveryResponse{
-		VersionInfo: "0",
+		VersionInfo: "5",
 		Resources:   []types.Any{},
 		TypeUrl:     clusterType,
-		Nonce:       "0",
+		Nonce:       "5",
 	}, streamCDS(t, cc))
 }
 
@@ -340,12 +342,12 @@ func TestIssue243(t *testing.T) {
 		)
 		rh.OnAdd(s1)
 		assertEqual(t, &v2.DiscoveryResponse{
-			VersionInfo: "0",
+			VersionInfo: "2",
 			Resources: []types.Any{
 				any(t, cluster("default/kuard/80/da39a3ee5e", "default/kuard", "default_kuard_80")),
 			},
 			TypeUrl: clusterType,
-			Nonce:   "0",
+			Nonce:   "2",
 		}, streamCDS(t, cc))
 	})
 }
@@ -383,12 +385,12 @@ func TestIssue247(t *testing.T) {
 	)
 	rh.OnAdd(s1)
 	assertEqual(t, &v2.DiscoveryResponse{
-		VersionInfo: "0",
+		VersionInfo: "2",
 		Resources: []types.Any{
 			any(t, cluster("default/kuard/80/da39a3ee5e", "default/kuard", "default_kuard_80")),
 		},
 		TypeUrl: clusterType,
-		Nonce:   "0",
+		Nonce:   "2",
 	}, streamCDS(t, cc))
 }
 func TestCDSResourceFiltering(t *testing.T) {
@@ -442,32 +444,31 @@ func TestCDSResourceFiltering(t *testing.T) {
 	)
 	rh.OnAdd(s2)
 	assertEqual(t, &v2.DiscoveryResponse{
-		VersionInfo: "0",
+		VersionInfo: "3",
 		Resources: []types.Any{
 			// note, resources are sorted by Cluster.Name
 			any(t, cluster("default/httpbin/8080/da39a3ee5e", "default/httpbin", "default_httpbin_8080")),
 			any(t, cluster("default/kuard/80/da39a3ee5e", "default/kuard", "default_kuard_80")),
 		},
 		TypeUrl: clusterType,
-		Nonce:   "0",
+		Nonce:   "3",
 	}, streamCDS(t, cc))
 
 	// assert we can filter on one resource
 	assertEqual(t, &v2.DiscoveryResponse{
-		VersionInfo: "0",
+		VersionInfo: "3",
 		Resources: []types.Any{
 			any(t, cluster("default/kuard/80/da39a3ee5e", "default/kuard", "default_kuard_80")),
 		},
 		TypeUrl: clusterType,
-		Nonce:   "0",
+		Nonce:   "3",
 	}, streamCDS(t, cc, "default/kuard/80/da39a3ee5e"))
 
-	// assert a non matching filter returns no results
-	// note: streamCDS would stall at this point.
+	// assert a non matching filter returns a response with no entries.
 	assertEqual(t, &v2.DiscoveryResponse{
-		VersionInfo: "0",
+		VersionInfo: "3",
 		TypeUrl:     clusterType,
-		Nonce:       "0",
+		Nonce:       "3",
 	}, streamCDS(t, cc, "default/httpbin/9000"))
 }
 
@@ -508,12 +509,12 @@ func TestClusterCircuitbreakerAnnotations(t *testing.T) {
 
 	// check that it's been translated correctly.
 	assertEqual(t, &v2.DiscoveryResponse{
-		VersionInfo: "0",
+		VersionInfo: "2",
 		Resources: []types.Any{
 			any(t, &v2.Cluster{
-				Name:        "default/kuard/8080/da39a3ee5e",
-				AltStatName: "default_kuard_8080",
-				Type:        v2.Cluster_EDS,
+				Name:                 "default/kuard/8080/da39a3ee5e",
+				AltStatName:          "default_kuard_8080",
+				ClusterDiscoveryType: envoy.ClusterDiscoveryType(v2.Cluster_EDS),
 				EdsClusterConfig: &v2.Cluster_EdsClusterConfig{
 					EdsConfig:   envoy.ConfigSource("contour"),
 					ServiceName: "default/kuard",
@@ -532,7 +533,7 @@ func TestClusterCircuitbreakerAnnotations(t *testing.T) {
 			}),
 		},
 		TypeUrl: clusterType,
-		Nonce:   "0",
+		Nonce:   "2",
 	}, streamCDS(t, cc))
 
 	// update s1 with slightly weird values
@@ -554,12 +555,12 @@ func TestClusterCircuitbreakerAnnotations(t *testing.T) {
 
 	// check that it's been translated correctly.
 	assertEqual(t, &v2.DiscoveryResponse{
-		VersionInfo: "0",
+		VersionInfo: "3",
 		Resources: []types.Any{
 			any(t, &v2.Cluster{
-				Name:        "default/kuard/8080/da39a3ee5e",
-				AltStatName: "default_kuard_8080",
-				Type:        v2.Cluster_EDS,
+				Name:                 "default/kuard/8080/da39a3ee5e",
+				AltStatName:          "default_kuard_8080",
+				ClusterDiscoveryType: envoy.ClusterDiscoveryType(v2.Cluster_EDS),
 				EdsClusterConfig: &v2.Cluster_EdsClusterConfig{
 					EdsConfig:   envoy.ConfigSource("contour"),
 					ServiceName: "default/kuard",
@@ -575,7 +576,7 @@ func TestClusterCircuitbreakerAnnotations(t *testing.T) {
 			}),
 		},
 		TypeUrl: clusterType,
-		Nonce:   "0",
+		Nonce:   "3",
 	}, streamCDS(t, cc))
 }
 
@@ -625,12 +626,12 @@ func TestClusterPerServiceParameters(t *testing.T) {
 	})
 
 	assertEqual(t, &v2.DiscoveryResponse{
-		VersionInfo: "0",
+		VersionInfo: "1",
 		Resources: []types.Any{
 			any(t, cluster("default/kuard/80/da39a3ee5e", "default/kuard", "default_kuard_80")),
 		},
 		TypeUrl: clusterType,
-		Nonce:   "0",
+		Nonce:   "1",
 	}, streamCDS(t, cc))
 }
 
@@ -673,19 +674,19 @@ func TestClusterLoadBalancerStrategyPerRoute(t *testing.T) {
 				Services: []ingressroutev1.Service{{
 					Name:     "kuard",
 					Port:     80,
-					Strategy: "Maglev",
+					Strategy: "WeightedLeastRequest",
 				}},
 			}},
 		},
 	})
 
 	assertEqual(t, &v2.DiscoveryResponse{
-		VersionInfo: "0",
+		VersionInfo: "1",
 		Resources: []types.Any{
 			any(t, &v2.Cluster{
-				Name:        "default/kuard/80/58d888c08a",
-				AltStatName: "default_kuard_80",
-				Type:        v2.Cluster_EDS,
+				Name:                 "default/kuard/80/58d888c08a",
+				AltStatName:          "default_kuard_80",
+				ClusterDiscoveryType: envoy.ClusterDiscoveryType(v2.Cluster_EDS),
 				EdsClusterConfig: &v2.Cluster_EdsClusterConfig{
 					EdsConfig:   envoy.ConfigSource("contour"),
 					ServiceName: "default/kuard",
@@ -695,20 +696,340 @@ func TestClusterLoadBalancerStrategyPerRoute(t *testing.T) {
 				CommonLbConfig: envoy.ClusterCommonLBConfig(),
 			}),
 			any(t, &v2.Cluster{
-				Name:        "default/kuard/80/843e4ded8f",
-				AltStatName: "default_kuard_80",
-				Type:        v2.Cluster_EDS,
+				Name:                 "default/kuard/80/8bf87fefba",
+				AltStatName:          "default_kuard_80",
+				ClusterDiscoveryType: envoy.ClusterDiscoveryType(v2.Cluster_EDS),
 				EdsClusterConfig: &v2.Cluster_EdsClusterConfig{
 					EdsConfig:   envoy.ConfigSource("contour"),
 					ServiceName: "default/kuard",
 				},
 				ConnectTimeout: 250 * time.Millisecond,
-				LbPolicy:       v2.Cluster_MAGLEV,
+				LbPolicy:       v2.Cluster_LEAST_REQUEST,
 				CommonLbConfig: envoy.ClusterCommonLBConfig(),
 			}),
 		},
 		TypeUrl: clusterType,
-		Nonce:   "0",
+		Nonce:   "1",
+	}, streamCDS(t, cc))
+}
+
+func TestClusterWithHealthChecks(t *testing.T) {
+	rh, cc, done := setup(t)
+	defer done()
+
+	rh.OnAdd(&v1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "kuard",
+			Namespace: "default",
+		},
+		Spec: v1.ServiceSpec{
+			Ports: []v1.ServicePort{{
+				Protocol:   "TCP",
+				Port:       80,
+				TargetPort: intstr.FromInt(8080),
+			}},
+		},
+	})
+
+	rh.OnAdd(&ingressroutev1.IngressRoute{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "simple",
+			Namespace: "default",
+		},
+		Spec: ingressroutev1.IngressRouteSpec{
+			VirtualHost: &ingressroutev1.VirtualHost{Fqdn: "www.example.com"},
+			Routes: []ingressroutev1.Route{{
+				Match: "/a",
+				Services: []ingressroutev1.Service{{
+					Name:   "kuard",
+					Port:   80,
+					Weight: 90,
+					HealthCheck: &ingressroutev1.HealthCheck{
+						Path: "/healthz",
+					},
+				}},
+			}},
+		},
+	})
+
+	assertEqual(t, &v2.DiscoveryResponse{
+		VersionInfo: "1",
+		Resources: []types.Any{
+			any(t, clusterWithHealthCheck("default/kuard/80/bc862a33ca", "default/kuard", "default_kuard_80", "/healthz", true)),
+		},
+		TypeUrl: clusterType,
+		Nonce:   "1",
+	}, streamCDS(t, cc))
+}
+
+// Test that contour correctly recognizes the "contour.heptio.com/upstream-protocol.tls"
+// service annotation.
+func TestClusterServiceTLSBackend(t *testing.T) {
+	rh, cc, done := setup(t)
+	defer done()
+
+	i1 := &v1beta1.Ingress{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "kuard",
+			Namespace: "default",
+		},
+		Spec: v1beta1.IngressSpec{
+			Backend: &v1beta1.IngressBackend{
+				ServiceName: "kuard",
+				ServicePort: intstr.FromInt(443),
+			},
+		},
+	}
+	rh.OnAdd(i1)
+
+	s1 := &v1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "kuard",
+			Namespace: "default",
+			Annotations: map[string]string{
+				"contour.heptio.com/upstream-protocol.tls": "securebackend",
+			},
+		},
+		Spec: v1.ServiceSpec{
+			Ports: []v1.ServicePort{{
+				Name:       "securebackend",
+				Protocol:   "TCP",
+				Port:       443,
+				TargetPort: intstr.FromInt(8888),
+			}},
+		},
+	}
+	rh.OnAdd(s1)
+
+	want := tlscluster("default/kuard/443/da39a3ee5e", "default/kuard/securebackend", "default_kuard_443", nil, "")
+
+	assertEqual(t, &v2.DiscoveryResponse{
+		VersionInfo: "2",
+		Resources: []types.Any{
+			any(t, want),
+		},
+		TypeUrl: clusterType,
+		Nonce:   "2",
+	}, streamCDS(t, cc))
+}
+
+func TestClusterServiceTLSBackendCAValidation(t *testing.T) {
+	rh, cc, done := setup(t)
+	defer done()
+
+	rh.OnAdd(&v1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "kuard",
+			Namespace: "default",
+			Annotations: map[string]string{
+				"contour.heptio.com/upstream-protocol.tls": "securebackend,443",
+			},
+		},
+		Spec: v1.ServiceSpec{
+			Ports: []v1.ServicePort{{
+				Name:       "securebackend",
+				Protocol:   "TCP",
+				Port:       443,
+				TargetPort: intstr.FromInt(8080),
+			}},
+		},
+	})
+
+	secret := &v1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "foo",
+			Namespace: "default",
+		},
+		Data: map[string][]byte{
+			envoy.CACertificateKey: []byte("ca"),
+		},
+	}
+
+	rh.OnAdd(secret)
+
+	ir1 := &ingressroutev1.IngressRoute{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "simple",
+			Namespace: "default",
+		},
+		Spec: ingressroutev1.IngressRouteSpec{
+			VirtualHost: &ingressroutev1.VirtualHost{Fqdn: "www.example.com"},
+			Routes: []ingressroutev1.Route{{
+				Match: "/a",
+				Services: []ingressroutev1.Service{{
+					Name: "kuard",
+					Port: 443,
+				}},
+			}},
+		},
+	}
+
+	rh.OnAdd(ir1)
+
+	assertEqual(t, &v2.DiscoveryResponse{
+		VersionInfo: "1",
+		Resources: []types.Any{
+			any(t, tlscluster(
+				"default/kuard/443/da39a3ee5e",
+				"default/kuard/securebackend",
+				"default_kuard_443",
+				nil,
+				"")),
+		},
+		TypeUrl: clusterType,
+		Nonce:   "1",
+	}, streamCDS(t, cc))
+
+	ir2 := &ingressroutev1.IngressRoute{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "simple",
+			Namespace: "default",
+		},
+		Spec: ingressroutev1.IngressRouteSpec{
+			VirtualHost: &ingressroutev1.VirtualHost{Fqdn: "www.example.com"},
+			Routes: []ingressroutev1.Route{{
+				Match: "/a",
+				Services: []ingressroutev1.Service{{
+					Name: "kuard",
+					Port: 443,
+					UpstreamValidation: &ingressroutev1.UpstreamValidation{
+						CACertificate: "foo",
+						SubjectName:   "subjname",
+					},
+				}},
+			}},
+		},
+	}
+
+	rh.OnUpdate(ir1, ir2)
+
+	assertEqual(t, &v2.DiscoveryResponse{
+		VersionInfo: "2",
+		Resources: []types.Any{
+			any(t, tlscluster(
+				"default/kuard/443/98c0f31c72",
+				"default/kuard/securebackend",
+				"default_kuard_443",
+				[]byte("ca"),
+				"subjname")),
+		},
+		TypeUrl: clusterType,
+		Nonce:   "2",
+	}, streamCDS(t, cc))
+}
+
+// Test processing a service type ExternalName
+func TestExternalNameService(t *testing.T) {
+	rh, cc, done := setup(t)
+	defer done()
+
+	i1 := &v1beta1.Ingress{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "kuard",
+			Namespace: "default",
+		},
+		Spec: v1beta1.IngressSpec{
+			Backend: &v1beta1.IngressBackend{
+				ServiceName: "kuard",
+				ServicePort: intstr.FromInt(80),
+			},
+		},
+	}
+	rh.OnAdd(i1)
+
+	// s1 is a simple tcp 80 -> 8080 service.
+	s1 := externalnameservice("default", "kuard", "foo.io", v1.ServicePort{
+		Protocol:   "TCP",
+		Port:       80,
+		TargetPort: intstr.FromInt(8080),
+	})
+	rh.OnAdd(s1)
+
+	assertEqual(t, &v2.DiscoveryResponse{
+		VersionInfo: "2",
+		Resources: []types.Any{
+			any(t, externalnamecluster("default/kuard/80/da39a3ee5e", "default/kuard/", "default_kuard_80", "foo.io", 80)),
+		},
+		TypeUrl: clusterType,
+		Nonce:   "2",
+	}, streamCDS(t, cc))
+}
+
+// Test processing a service that exists but is not referenced
+func TestUnreferencedService(t *testing.T) {
+	rh, cc, done := setup(t)
+	defer done()
+
+	rh.OnAdd(&v1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "kuard",
+			Namespace: "default",
+		},
+		Spec: v1.ServiceSpec{
+			Ports: []v1.ServicePort{{
+				Protocol:   "TCP",
+				Port:       80,
+				TargetPort: intstr.FromInt(8080),
+			}},
+		},
+	})
+
+	rh.OnAdd(&ingressroutev1.IngressRoute{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "simple",
+			Namespace: "default",
+		},
+		Spec: ingressroutev1.IngressRouteSpec{
+			VirtualHost: &ingressroutev1.VirtualHost{Fqdn: "www.example.com"},
+			Routes: []ingressroutev1.Route{{
+				Match: "/a",
+				Services: []ingressroutev1.Service{{
+					Name:   "kuard",
+					Port:   80,
+					Weight: 90,
+				}},
+			}, {
+				Match: "/b",
+				Services: []ingressroutev1.Service{{
+					Name:   "kuard",
+					Port:   80,
+					Weight: 60,
+				}},
+			}},
+		},
+	})
+
+	assertEqual(t, &v2.DiscoveryResponse{
+		VersionInfo: "1",
+		Resources: []types.Any{
+			any(t, cluster("default/kuard/80/da39a3ee5e", "default/kuard", "default_kuard_80")),
+		},
+		TypeUrl: clusterType,
+		Nonce:   "1",
+	}, streamCDS(t, cc))
+
+	// This service which is added should not cause a DAG rebuild
+	rh.OnAdd(&v1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "kuard-notreferenced",
+			Namespace: "default",
+		},
+		Spec: v1.ServiceSpec{
+			Ports: []v1.ServicePort{{
+				Protocol:   "TCP",
+				Port:       80,
+				TargetPort: intstr.FromInt(8080),
+			}},
+		},
+	})
+
+	assertEqual(t, &v2.DiscoveryResponse{
+		VersionInfo: "1",
+		Resources: []types.Any{
+			any(t, cluster("default/kuard/80/da39a3ee5e", "default/kuard", "default_kuard_80")),
+		},
+		TypeUrl: clusterType,
+		Nonce:   "1",
 	}, streamCDS(t, cc))
 }
 
@@ -738,9 +1059,9 @@ func streamCDS(t *testing.T, cc *grpc.ClientConn, rn ...string) *v2.DiscoveryRes
 
 func cluster(name, servicename, statName string) *v2.Cluster {
 	return &v2.Cluster{
-		Name:        name,
-		Type:        v2.Cluster_EDS,
-		AltStatName: statName,
+		Name:                 name,
+		ClusterDiscoveryType: envoy.ClusterDiscoveryType(v2.Cluster_EDS),
+		AltStatName:          statName,
 		EdsClusterConfig: &v2.Cluster_EdsClusterConfig{
 			EdsConfig:   envoy.ConfigSource("contour"),
 			ServiceName: servicename,
@@ -749,4 +1070,64 @@ func cluster(name, servicename, statName string) *v2.Cluster {
 		LbPolicy:       v2.Cluster_ROUND_ROBIN,
 		CommonLbConfig: envoy.ClusterCommonLBConfig(),
 	}
+}
+
+func externalnamecluster(name, servicename, statName, externalName string, port int) *v2.Cluster {
+	return &v2.Cluster{
+		Name:                 name,
+		ClusterDiscoveryType: envoy.ClusterDiscoveryType(v2.Cluster_STRICT_DNS),
+		AltStatName:          statName,
+		ConnectTimeout:       250 * time.Millisecond,
+		LbPolicy:             v2.Cluster_ROUND_ROBIN,
+		CommonLbConfig:       envoy.ClusterCommonLBConfig(),
+		LoadAssignment: &v2.ClusterLoadAssignment{
+			ClusterName: servicename,
+			Endpoints: []endpoint.LocalityLbEndpoints{{
+				LbEndpoints: []endpoint.LbEndpoint{{
+					HostIdentifier: &endpoint.LbEndpoint_Endpoint{
+						Endpoint: &endpoint.Endpoint{
+							Address: &core.Address{
+								Address: &core.Address_SocketAddress{
+									SocketAddress: &core.SocketAddress{
+										Address: externalName,
+										PortSpecifier: &core.SocketAddress_PortValue{
+											PortValue: uint32(port),
+										},
+									},
+								},
+							},
+						},
+					},
+				}},
+			}},
+		},
+	}
+}
+
+func tlscluster(name, servicename, statsName string, ca []byte, subjectName string) *v2.Cluster {
+	c := cluster(name, servicename, statsName)
+	c.TlsContext = envoy.UpstreamTLSContext(ca, subjectName)
+	return c
+}
+
+func clusterWithHealthCheck(name, servicename, statName, healthCheckPath string, drainConnOnHostRemoval bool) *v2.Cluster {
+	c := cluster(name, servicename, statName)
+	timeout := 2 * time.Second
+	interval := 10 * time.Second
+	unhealthyThreshold := types.UInt32Value{Value: 3}
+	healthyThreshold := types.UInt32Value{Value: 2}
+	c.HealthChecks = []*core.HealthCheck{{
+		Timeout:            &timeout,
+		Interval:           &interval,
+		UnhealthyThreshold: &unhealthyThreshold,
+		HealthyThreshold:   &healthyThreshold,
+		HealthChecker: &core.HealthCheck_HttpHealthCheck_{
+			HttpHealthCheck: &core.HealthCheck_HttpHealthCheck{
+				Host: "contour-envoy-healthcheck",
+				Path: healthCheckPath,
+			},
+		},
+	}}
+	c.DrainConnectionsOnHostRemoval = drainConnOnHostRemoval
+	return c
 }

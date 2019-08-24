@@ -13,11 +13,11 @@
 package envoy
 
 import (
-	"fmt"
 	"sort"
 	"time"
 
 	"github.com/envoyproxy/go-control-plane/envoy/api/v2/core"
+
 	"github.com/envoyproxy/go-control-plane/envoy/api/v2/route"
 	"github.com/gogo/protobuf/types"
 	"github.com/heptio/contour/internal/dag"
@@ -26,25 +26,30 @@ import (
 // RouteRoute creates a route.Route_Route for the services supplied.
 // If len(services) is greater than one, the route's action will be a
 // weighted cluster.
-func RouteRoute(r *dag.Route, services []*dag.HTTPService) *route.Route_Route {
+func RouteRoute(r *dag.Route) *route.Route_Route {
 	ra := route.RouteAction{
-		UseWebsocket:  bv(r.Websocket),
 		RetryPolicy:   retryPolicy(r),
 		Timeout:       timeout(r),
 		PrefixRewrite: r.PrefixRewrite,
+		HashPolicy:    hashPolicy(r),
 	}
 
-	switch len(services) {
+	if r.Websocket {
+		ra.UpgradeConfigs = append(ra.UpgradeConfigs,
+			&route.RouteAction_UpgradeConfig{
+				UpgradeType: "websocket",
+			},
+		)
+	}
+
+	switch len(r.Clusters) {
 	case 1:
 		ra.ClusterSpecifier = &route.RouteAction_Cluster{
-			Cluster: Clustername(&services[0].TCPService),
+			Cluster: Clustername(r.Clusters[0]),
 		}
-		ra.RequestHeadersToAdd = headers(
-			appendHeader("x-request-start", "t=%START_TIME(%s.%3f)%"),
-		)
 	default:
 		ra.ClusterSpecifier = &route.RouteAction_WeightedClusters{
-			WeightedClusters: weightedClusters(services),
+			WeightedClusters: weightedClusters(r.Clusters),
 		}
 	}
 	return &route.Route_Route{
@@ -52,8 +57,31 @@ func RouteRoute(r *dag.Route, services []*dag.HTTPService) *route.Route_Route {
 	}
 }
 
+// hashPolicy returns a slice of hash policies iff at least one of the route's
+// clusters supplied uses the `Cookie` load balancing stategy.
+func hashPolicy(r *dag.Route) []*route.RouteAction_HashPolicy {
+	for _, c := range r.Clusters {
+		if c.LoadBalancerStrategy == "Cookie" {
+			return []*route.RouteAction_HashPolicy{{
+				PolicySpecifier: &route.RouteAction_HashPolicy_Cookie_{
+					Cookie: &route.RouteAction_HashPolicy_Cookie{
+						Name: "X-Contour-Session-Affinity",
+						Ttl:  duration(0),
+						Path: "/",
+					},
+				},
+			}}
+		}
+	}
+	return nil
+}
+
 func timeout(r *dag.Route) *time.Duration {
-	switch r.Timeout {
+	if r.TimeoutPolicy == nil {
+		return nil
+	}
+
+	switch r.TimeoutPolicy.Timeout {
 	case 0:
 		// no timeout specified
 		return nil
@@ -62,22 +90,26 @@ func timeout(r *dag.Route) *time.Duration {
 		// envoy "infinite timeout"
 		return duration(0)
 	default:
-		return duration(r.Timeout)
+		return duration(r.TimeoutPolicy.Timeout)
 	}
 }
 
-func retryPolicy(r *dag.Route) *route.RouteAction_RetryPolicy {
-	if r.RetryOn == "" {
+func retryPolicy(r *dag.Route) *route.RetryPolicy {
+	if r.RetryPolicy == nil {
 		return nil
 	}
-	rp := &route.RouteAction_RetryPolicy{
-		RetryOn: r.RetryOn,
+	if r.RetryPolicy.RetryOn == "" {
+		return nil
 	}
-	if r.NumRetries > 0 {
-		rp.NumRetries = u32(r.NumRetries)
+
+	rp := &route.RetryPolicy{
+		RetryOn: r.RetryPolicy.RetryOn,
 	}
-	if r.PerTryTimeout > 0 {
-		timeout := r.PerTryTimeout
+	if r.RetryPolicy.NumRetries > 0 {
+		rp.NumRetries = u32(r.RetryPolicy.NumRetries)
+	}
+	if r.RetryPolicy.PerTryTimeout > 0 {
+		timeout := r.RetryPolicy.PerTryTimeout
 		rp.PerTryTimeout = &timeout
 	}
 	return rp
@@ -87,23 +119,29 @@ func retryPolicy(r *dag.Route) *route.RouteAction_RetryPolicy {
 func UpgradeHTTPS() *route.Route_Redirect {
 	return &route.Route_Redirect{
 		Redirect: &route.RedirectAction{
-			HttpsRedirect: true,
+			SchemeRewriteSpecifier: &route.RedirectAction_HttpsRedirect{
+				HttpsRedirect: true,
+			},
 		},
 	}
 }
 
+// RouteHeaders returns a list of headers to be applied at the Route level on envoy
+func RouteHeaders() []*core.HeaderValueOption {
+	return headers(
+		appendHeader("x-request-start", "t=%START_TIME(%s.%3f)%"),
+	)
+}
+
 // weightedClusters returns a route.WeightedCluster for multiple services.
-func weightedClusters(services []*dag.HTTPService) *route.WeightedCluster {
+func weightedClusters(clusters []*dag.Cluster) *route.WeightedCluster {
 	var wc route.WeightedCluster
 	var total int
-	for _, service := range services {
-		total += service.Weight
+	for _, cluster := range clusters {
+		total += cluster.Weight
 		wc.Clusters = append(wc.Clusters, &route.WeightedCluster_ClusterWeight{
-			Name:   Clustername(&service.TCPService),
-			Weight: u32(service.Weight),
-			RequestHeadersToAdd: headers(
-				appendHeader("x-request-start", "t=%START_TIME(%s.%3f)%"),
-			),
+			Name:   Clustername(cluster),
+			Weight: u32(cluster.Weight),
 		})
 	}
 	// Check if no weights were defined, if not default to even distribution
@@ -111,7 +149,7 @@ func weightedClusters(services []*dag.HTTPService) *route.WeightedCluster {
 		for _, c := range wc.Clusters {
 			c.Weight.Value = 1
 		}
-		total = len(services)
+		total = len(clusters)
 	}
 	wc.TotalWeight = u32(total)
 
@@ -119,8 +157,17 @@ func weightedClusters(services []*dag.HTTPService) *route.WeightedCluster {
 	return &wc
 }
 
-// PrefixMatch creates a RouteMatch for the supplied prefix.
-func PrefixMatch(prefix string) route.RouteMatch {
+// RouteRegex returns a regex matcher.
+func RouteRegex(regex string) route.RouteMatch {
+	return route.RouteMatch{
+		PathSpecifier: &route.RouteMatch_Regex{
+			Regex: regex,
+		},
+	}
+}
+
+// RoutePrefix returns a prefix matcher.
+func RoutePrefix(prefix string) route.RouteMatch {
 	return route.RouteMatch{
 		PathSpecifier: &route.RouteMatch_Prefix{
 			Prefix: prefix,
@@ -129,10 +176,10 @@ func PrefixMatch(prefix string) route.RouteMatch {
 }
 
 // VirtualHost creates a new route.VirtualHost.
-func VirtualHost(hostname string, port int) route.VirtualHost {
+func VirtualHost(hostname string) route.VirtualHost {
 	domains := []string{hostname}
 	if hostname != "*" {
-		domains = append(domains, fmt.Sprintf("%s:%d", hostname, port))
+		domains = append(domains, hostname+":*")
 	}
 	return route.VirtualHost{
 		Name:    hashname(60, hostname),

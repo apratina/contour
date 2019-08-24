@@ -20,7 +20,8 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/envoyproxy/go-control-plane/envoy/api/v2"
-	envoy_service_v2 "github.com/envoyproxy/go-control-plane/envoy/service/load_stats/v2"
+	discovery "github.com/envoyproxy/go-control-plane/envoy/service/discovery/v2"
+	loadstats "github.com/envoyproxy/go-control-plane/envoy/service/load_stats/v2"
 	"github.com/sirupsen/logrus"
 )
 
@@ -30,7 +31,7 @@ const (
 )
 
 // NewAPI returns a *grpc.Server which responds to the Envoy v2 xDS gRPC API.
-func NewAPI(log logrus.FieldLogger, cacheMap map[string]Cache) *grpc.Server {
+func NewAPI(log logrus.FieldLogger, resources map[string]Resource) *grpc.Server {
 	opts := []grpc.ServerOption{
 		// By default the Go grpc library defaults to a value of ~100 streams per
 		// connection. This number is likely derived from the HTTP/2 spec:
@@ -44,20 +45,7 @@ func NewAPI(log logrus.FieldLogger, cacheMap map[string]Cache) *grpc.Server {
 	s := &grpcServer{
 		xdsHandler{
 			FieldLogger: log,
-			resources: map[string]resource{
-				clusterType: &CDS{
-					Cache: cacheMap[clusterType],
-				},
-				endpointType: &EDS{
-					Cache: cacheMap[endpointType],
-				},
-				listenerType: &LDS{
-					Cache: cacheMap[listenerType],
-				},
-				routeType: &RDS{
-					Cache: cacheMap[routeType],
-				},
-			},
+			resources:   resources,
 		},
 	}
 
@@ -65,6 +53,7 @@ func NewAPI(log logrus.FieldLogger, cacheMap map[string]Cache) *grpc.Server {
 	v2.RegisterEndpointDiscoveryServiceServer(g, s)
 	v2.RegisterListenerDiscoveryServiceServer(g, s)
 	v2.RegisterRouteDiscoveryServiceServer(g, s)
+	discovery.RegisterSecretDiscoveryServiceServer(g, s)
 	return g
 }
 
@@ -73,28 +62,36 @@ type grpcServer struct {
 	xdsHandler
 }
 
-// A resource provides resources formatted as []types.Any.
-type resource interface {
-	Cache
-
-	// TypeURL returns the typeURL of messages returned from Values.
-	TypeURL() string
-}
-
 func (s *grpcServer) FetchClusters(_ context.Context, req *v2.DiscoveryRequest) (*v2.DiscoveryResponse, error) {
-	return s.fetch(req)
+	return nil, status.Errorf(codes.Unimplemented, "FetchClusters unimplemented")
 }
 
 func (s *grpcServer) FetchEndpoints(_ context.Context, req *v2.DiscoveryRequest) (*v2.DiscoveryResponse, error) {
-	return s.fetch(req)
+	return nil, status.Errorf(codes.Unimplemented, "FetchEndpoints unimplemented")
+}
+
+func (s *grpcServer) DeltaEndpoints(v2.EndpointDiscoveryService_DeltaEndpointsServer) error {
+	return status.Errorf(codes.Unimplemented, "DeltaEndpoints unimplemented")
 }
 
 func (s *grpcServer) FetchListeners(_ context.Context, req *v2.DiscoveryRequest) (*v2.DiscoveryResponse, error) {
-	return s.fetch(req)
+	return nil, status.Errorf(codes.Unimplemented, "FetchListeners unimplemented")
+}
+
+func (s *grpcServer) DeltaListeners(v2.ListenerDiscoveryService_DeltaListenersServer) error {
+	return status.Errorf(codes.Unimplemented, "DeltaListeners unimplemented")
 }
 
 func (s *grpcServer) FetchRoutes(_ context.Context, req *v2.DiscoveryRequest) (*v2.DiscoveryResponse, error) {
-	return s.fetch(req)
+	return nil, status.Errorf(codes.Unimplemented, "FetchRoutes unimplemented")
+}
+
+func (s *grpcServer) FetchSecrets(_ context.Context, req *v2.DiscoveryRequest) (*v2.DiscoveryResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "FetchSecrets unimplemented")
+}
+
+func (s *grpcServer) DeltaSecrets(discovery.SecretDiscoveryService_DeltaSecretsServer) error {
+	return status.Errorf(codes.Unimplemented, "DeltaSecrets unimplemented")
 }
 
 func (s *grpcServer) StreamClusters(srv v2.ClusterDiscoveryService_StreamClustersServer) error {
@@ -105,15 +102,15 @@ func (s *grpcServer) StreamEndpoints(srv v2.EndpointDiscoveryService_StreamEndpo
 	return s.stream(srv)
 }
 
-func (s *grpcServer) StreamLoadStats(srv envoy_service_v2.LoadReportingService_StreamLoadStatsServer) error {
+func (s *grpcServer) StreamLoadStats(srv loadstats.LoadReportingService_StreamLoadStatsServer) error {
 	return status.Errorf(codes.Unimplemented, "StreamLoadStats unimplemented")
 }
 
-func (s *grpcServer) IncrementalClusters(v2.ClusterDiscoveryService_IncrementalClustersServer) error {
+func (s *grpcServer) DeltaClusters(v2.ClusterDiscoveryService_DeltaClustersServer) error {
 	return status.Errorf(codes.Unimplemented, "IncrementalClusters unimplemented")
 }
 
-func (s *grpcServer) IncrementalRoutes(v2.RouteDiscoveryService_IncrementalRoutesServer) error {
+func (s *grpcServer) DeltaRoutes(v2.RouteDiscoveryService_DeltaRoutesServer) error {
 	return status.Errorf(codes.Unimplemented, "IncrementalRoutes unimplemented")
 }
 
@@ -122,5 +119,9 @@ func (s *grpcServer) StreamListeners(srv v2.ListenerDiscoveryService_StreamListe
 }
 
 func (s *grpcServer) StreamRoutes(srv v2.RouteDiscoveryService_StreamRoutesServer) error {
+	return s.stream(srv)
+}
+
+func (s *grpcServer) StreamSecrets(srv discovery.SecretDiscoveryService_StreamSecretsServer) error {
 	return s.stream(srv)
 }

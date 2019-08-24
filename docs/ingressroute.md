@@ -118,7 +118,7 @@ ingressroute "basic" deleted
 
 ## IngressRoute API Specification
 
-There are a number of [working examples](https://github.com/heptio/contour/tree/master/deployment/example-workload/ingressroute) of IngressRoute objects in the `deployment/example-workload` directory.
+There are a number of [working examples](https://github.com/heptio/contour/tree/master/examples/example-workload/ingressroute) of IngressRoute objects in the `examples/example-workload` directory.
 We will use these examples as a mechanism to describe IngressRoute API functionality.
 
 ### Virtual Host Configuration
@@ -240,6 +240,9 @@ spec:
           port: 80
 ```
 
+If the `tls.secretName` property contains a slash, eg. `somenamespace/somesecret` then, subject to TLS Certificate Delegation, the TLS certificate will be read from `somesecret` in `somenamespace`.
+See TLS Certificate Delegation below for more information.
+
 The TLS **Minimum Protocol Version** a vhost should negotiate can be specified by setting the `spec.virtualhost.tls.minimumProtocolVersion`:
   - 1.3
   - 1.2
@@ -264,11 +267,88 @@ spec:
         - name: s1
           port: 80
     - match: /blog
+      permitInsecure: true
       services: 
         - name: s2
           port: 80
-          permitInsecure: true
 ```
+
+#### Upstream TLS
+
+An IngressRoute route can proxy to an upstream TLS connection by first annotating the upstream Kubernetes service with: `contour.heptio.com/upstream-protocol.tls: "443,https"`.
+This annoation tells Contour which port should be used for the TLS connection.
+In this example, the upstream service is named `https` and uses port `443`.
+Additionally, it is possible for Envoy to verify the backend service's certificate.
+The service of an `IngressRoute` can optionally specify a `validation` struct which has a manditory `caSecret` key as well as an manditory `subjectName`.
+
+Note: If spec.routes.services[].validation is present, spec.routes.services[].{name,port} must point to a service with a matching contour.heptio.com/upstream-protocol.tls Service annotation.
+
+##### Sample YAML
+
+```yaml
+apiVersion: contour.heptio.com/v1beta1
+kind: IngressRoute
+metadata:
+  name: secure-backend
+spec:
+  virtualhost:
+    fqdn: www.example.com  
+  routes:
+    - match: /
+      services:
+        - name: service
+          port: 8443
+          validation:
+            caSecret: my-certificate-authority
+            subjectName: backend.example.com
+```
+
+##### Error conditions
+
+If the `validation` spec is defined on a service, but the secret which it references does not exist, Contour will rejct the update and set the status of the `IngressRoute` object accordingly.
+This is to help prevent the case of proxying to an upstream where validation is requested, but not yet available.
+
+```yaml
+Status:
+  Current Status:  invalid
+  Description:     route "/": service "tls-nginx": upstreamValidation requested but secret not found or misconfigured
+```
+
+#### TLS Certificate Delegation
+
+In order to support wildcard certificates, TLS certificates for a `*.somedomain.com`, which are stored in a namespace controlled by the cluster administrator, Contour supports a facility known as TLS Certificate Delegation.
+This facility allows the owner of a TLS certificate to delegate, for the purposes of reference the TLS certificate, the when processing an IngressRoute to Contour will reference the Secret object from another namespace.
+
+```yaml
+apiVersion: contour.heptio.com/v1beta1
+kind: TLSCertificateDelegation
+metadata:
+  name: example-com-wildcard
+  namespace: www-admin
+spec:
+  delegations:
+    - secretName: example-com-wildcard
+      targetNamespaces:
+      - example-com
+---
+apiVersion: contour.heptio.com/v1beta1
+kind: IngressRoute
+metadata:
+  name: www
+  namespace: example-com
+spec:
+  virtualhost:
+    fqdn: foo2.bar.com
+    tls:
+      secretName: www-admin/example-com-wildcard
+  routes:
+    - match: /
+      services:
+        - name: s1
+          port: 80
+```
+
+In this example, the permission for Contour to reference the Secret `example-com-wildcard` in the `admin` namespace has been delegated to IngressRoute objects in the `example-com` namespace.
 
 ### Routing
 
@@ -362,6 +442,46 @@ IngressRoute weighting follows some specific rules:
 - Weights are relative and do not need to add up to 100. If all weights for a route are specified, then the "total" weight is the sum of those specified. As an example, if weights are 20, 30, 20 for three upstreams, the total weight would be 70. In this example, a weight of 30 would receive approximately 42.9% of traffic (30/70 = .4285).
 - If some weights are specified but others are not, then it's assumed that upstreams without weights have an implicit weight of zero, and thus will not receive traffic.
 
+#### Request Timeout
+
+Each Route can be configured to have a timeout policy and a retry policy as shown:
+
+```yaml
+# request-timeout.ingressroute.yaml
+apiVersion: contour.heptio.com/v1beta1
+kind: IngressRoute
+metadata:
+  name: request-timeout
+  namespace: default
+spec:
+  virtualhost:
+    fqdn: timeout.bar.com
+  routes:
+  - match: /
+    timeoutPolicy:
+      request: 1s
+    retryPolicy:
+      count: 3
+      perTryTimeout: 150ms
+    services:
+    - name: s1
+      port: 80
+``` 
+
+In this example, requests to `timeout.bar.com/` will have a request timeout policy of 1s. 
+This refers to the time that spans between the point at which complete client request has been processed by the proxy, and when the response from the server has been completely processed. 
+
+- `timeoutPolicy.request` This field can be any positive time period or "infinity". 
+The time period of **0s** will also be treated as infinity. 
+By default, Envoy has a 15 second timeout for a backend service to respond.
+More information can be found in [Envoy's documentation](https://www.envoyproxy.io/docs/envoy/latest/api-v2/api/v2/route/route.proto.html#envoy-api-field-route-routeaction-timeout).
+
+- `retryPolicy`: A retry will be attempted if the server returns an error code in the 5xx range, or if the server takes more than `retryPolicy.perTryTimeout` to process a request. 
+    - `retryPolicy.count` specifies the maximum number of retries allowed. This parameter is optional and defaults to 1.
+    - `retryPolicy.perTryTimeout` specifies the timeout per retry. If this field is greater than the request timeout, it is ignored. This parameter is optional. 
+    If left unspecified, `timeoutPolicy.request` will be used. 
+
+
 #### Load Balancing Strategy
 
 Each upstream service can have a load balancing strategy applied to determine which of its Endpoints is selected for the request.
@@ -369,8 +489,6 @@ The following list are the options available to choose from:
 
 - `RoundRobin`: Each healthy upstream Endpoint is selected in round robin order (Default strategy if none selected).
 - `WeightedLeastRequest`: The least request strategy uses an O(1) algorithm which selects two random healthy Endpoints and picks the Endpoint which has fewer active requests. Note: This algorithm is simple and sufficient for load testing. It should not be used where true weighted least request behavior is desired.
-- `RingHash`: The ring/modulo hash load balancer implements consistent hashing to upstream Endpoints.
-- `Maglev`: The Maglev strategy implements consistent hashing to upstream Endpoints
 - `Random`: The random strategy selects a random healthy Endpoints.
 
 More information on the load balancing strategy can be found in [Envoy's documentation](https://www.envoyproxy.io/docs/envoy/latest/intro/arch_overview/load_balancing.html).
@@ -397,37 +515,34 @@ spec:
           port: 80
           strategy: WeightedLeastRequest
 ```
+#### Session Affinity
 
-#### IngressRoute Default Load Balancing Strategy (Not supported in beta.1)
-
-In order to reduce the amount of duplicated configuration, the IngressRoute specification supports a default Strategy that will be applied to all Services.
-You may still override this default on a per-Service basis.
-
-In this example, Services `s1-def-strategy` and `s2-def-strategy` will both have requests distributed across their Endpoints using the WeightedLeastRequest strategy.
-Service `s3-def-strategy` will have requests distributed randomly.
+Session affinity, also known as _sticky sessions_, is a load balancing strategy whereby a sequence of requests from a single client are consitently routed to the same application backend.
+Contour supports session affinity with the `strategy: Cookie` key on a per service basis.
 
 ```yaml
-# default-lb-strategy.ingressroute.yaml
 apiVersion: contour.heptio.com/v1beta1
 kind: IngressRoute
 metadata:
-  name: default-lb-strategy
+  name: httpbin
   namespace: default
 spec:
   virtualhost:
-    fqdn: default-strategy.bar.com
-  strategy: WeightedLeastRequest # Default LB algorithm to be applied to services
+    fqdn: httpbin.davecheney.com
   routes:
-    - match: /
-      services:
-        - name: s1-def-strategy
-          port: 80
-        - name: s2-def-strategy
-          port: 80
-        - name: s3-def-strategy
-          port: 80
-          strategy: Random # Overrides default LB algorithm for only this Service
+  - match: /
+    services:
+    - name: httpbin
+      port: 8080
+      strategy: Cookie
 ```
+##### Limitations
+
+Session affinity is based on the premise that the backend servers are robust, do not change ordering, or grow and shrink according to load.
+None of these properties are guaranteed by a Kubernetes cluster and will be visible to applications that rely heavily on session affinity.
+
+Any pertibation in the set of pods backing a service risks redistributing backends around the hash ring.
+This is an unavoidable consiquence of Envoy's session affinity implementation and the pods-as-cattle approach of Kubernetes.
 
 #### Per-Upstream Active Health Checking
 
@@ -573,12 +688,39 @@ spec:
           port: 80
 ```
 
+#### ExternalName
+
+IngressRoute supports routing traffic to service types `ExternalName`.
+Contour looks at the `spec.externalName` field of the service and configures the route to use that DNS name instead of utilizing EDS.
+
+There's nothing specific in the `IngressRoute` object that needs configured other than referencing a service of type `ExternalName`.
+
+NOTE: The ports are required to be specified.
+
+```
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    run: externaldns
+  name: externaldns
+  namespace: default
+spec:
+  externalName: foo-basic.bar.com
+  ports:
+  - name: http
+    port: 80
+    protocol: TCP
+    targetPort: 80
+  type: ExternalName
+```
+
 ## IngressRoute Delegation
 
 A key feature of the IngressRoute specification is route delegation which follows the working model of DNS:
 
-> As the owner of a DNS domain, for example `heptio.com`, I delegate to another nameserver the responsibility for handing the subdomain `app.heptio.com`.
-> Any nameserver can hold a record for `app.heptio.com`, but without the linkage from the parent `heptio.com` nameserver, its information is unreachable and non authoritative.
+> As the owner of a DNS domain, for example `whitehouse.gov`, I delegate to another nameserver the responsibility for handing the subdomain `treasury.whitehouse.gov`.
+> Any nameserver can hold a record for `treasury.whitehouse.gov`, but without the linkage from the parent `whitehouse.gov` nameserver, its information is unreachable and non authoritative.
 
 The "root" IngressRoute is the only entry point for an ingress virtual host and is used as the top level configuration of a cluster's ingress resources.
 Each root IngressRoute defines a `virtualhost` key, which describes properties such as the fully qualified name of the virtual host, TLS configuration, etc.
@@ -739,6 +881,10 @@ This restricted mode is enabled in Contour by specifying a command line flag, `-
 
 IngressRoutes with a defined `virtualhost` field that are not in one of the allowed root namespaces will be flagged as `invalid` and will be ignored by Contour.
 
+Additionally, when defined, Contour will only watch for Kubernetes secrets in these namespaces ignoring changes in all other namespaces.
+Proper RBAC rules should also be created to restrict what namespaces Contour has access matching the namespaces passed to the command line flag.
+An example of this is included in the [examples directory](../examples/root-rbac) and shows how you might create a namespace called `root-ingressroutes`.
+
 > **NOTE: The restricted root namespace feature is only supported for IngressRoute CRDs.
 > `--ingressroute-root-namespaces` does not affect the operation of `v1beta1.Ingress` objects**
 
@@ -746,10 +892,14 @@ IngressRoutes with a defined `virtualhost` field that are not in one of the allo
 
 Ingressroute supports proxying of TLS encapsulated TCP sessions.
 
-The TCP session must be encrypted with TLS.
+_Note_: The TCP session must be encrypted with TLS.
 This is necessary so that Envoy can use SNI to route the incoming request to the correct service.
 
-```
+### TLS Termination at the edge
+
+If `spec.virtualhost.tls.secretName` is present then that secret will be used to decrypt the TCP traffic at the edge.
+
+```yaml
 apiVersion: contour.heptio.com/v1beta1
 kind: IngressRoute
 metadata:
@@ -774,17 +924,43 @@ spec:
       port: 80
 ```
 
-The `spec.tcpproxy` key indicates that this _root_ IngressRoute will forward all de-encrypted TCP traffic to the backend service.
+The `spec.tcpproxy` key indicates that this _root_ IngressRoute will forward the de-encrypted TCP traffic to the backend service.
 
-In case `spec.virtualhost.tls` is not present, TLS is not going to be terminated
-on Envoy and will be forwarded to the specified services, where the termination
-would happen. This is called SSL/TLS Passthrough.
+### TLS passthrough to the backend service
+
+If you wish to handle the TLS handshake at the backend service set `spec.virtualhost.tls.passthrough: true` indicates that once SNI demuxing is performed, the encrypted connection will be forwarded to the backend service. The backend service is expected to have a key which matches the SNI header received at the edge, and be capable of completing the TLS handshake. This is called SSL/TLS Passthrough.
+
+```yaml
+apiVersion: contour.heptio.com/v1beta1
+kind: IngressRoute
+metadata:
+  name: example
+  namespace: default
+spec:
+  virtualhost:
+    fqdn: tcp.example.com
+    tls:
+      passthrough: true
+  tcpproxy:
+    services:
+    - name: tcpservice
+      port: 8080
+    - name: otherservice
+      port: 9999
+      weight: 20
+  routes:
+  - match: /
+    services:
+    - name: kuard
+      port: 80
+```
 
 ### Limitations
 
 The current limitations are present in Contour 0.8. These will be addressed in later Contour versions.
 
 - TCP Proxying is not available on Kubernetes Ingress objects.
+- A dummy `spec.routes` entry is required for input validation.
 
 ## Status Reporting
 

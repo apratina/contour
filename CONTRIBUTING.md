@@ -12,31 +12,19 @@ This section describes how to build Contour from source.
 
 1. *Install Go*
 
-    Contour requires [Go 1.9][1] or later.
+    Contour requires [Go 1.12][1] or later.
     We also assume that you're familiar with Go's [`GOPATH` workspace][3] convention, and have the appropriate environment variables set.
-
-2. *Install `dep`*
-
-    Contour uses [`dep`][2] for dependency management.
-   `dep` is a fast moving project so even if you have installed it previously, it's a good idea to update to the latest version using the `go get -u` flag.
-
-    ```
-    go get -u github.com/golang/dep/cmd/dep
-    ```
 
 ### Fetch the source
 
-Contour uses [`dep`][2] for dependency management, but to reduce the size of the repository, does not include a copy of its dependencies.
-This might change in the future, but for now use the following command to fetch the source for Contour and its dependencies.
+Contour uses [`go modules`][2] for dependency management.
 
 ```
-go get -d github.com/heptio/contour
-cd $GOPATH/src/github.com/heptio/contour
-dep ensure -vendor-only
+go get github.com/heptio/contour
 ```
 
 Go is very particular when it comes to the location of the source code in your `$GOPATH`.
-The easiest way to make the `go` tool happy is to rename Heptio's remote location to something else, and substitute your fork for `origin`.
+The easiest way to make the `go` tool happy is to rename Contour's remote location to something else, and substitute your fork for `origin`.
 For example, to set `origin` to your fork, run this command substituting your GitHub username where appropriate.
 
 ```
@@ -53,43 +41,27 @@ The remainder of this document assumes your terminal's working directory is `$GO
 To build Contour, run:
 
 ```
-go build ./cmd/contour
+make
 ```
 
-This assumes your working directory is set to `$GOPATH/src/github.com/heptio/contour`.
-If you're somewhere else in the file system you can instead run:
+This uses a `go install` and produces a `contour` binary in your `$GOPATH/bin` directory.
 
-```
-go build github.com/heptio/contour/cmd/contour
-```
-
-This produces a `contour` binary in your current working directory.
-
-_TIP_: You may prefer to use `go install` rather than `go build` to cache build artifacts and reduce future compile times.
-In this case the binary is placed in `$GOPATH/bin/contour`.
 
 ### Running the unit tests
 
 Once you have Contour building, you can run all the unit tests for the project:
 
 ```
-go test ./...
+make check
 ```
 
 This assumes your working directory is set to `$GOPATH/src/github.com/heptio/contour`. 
-If you're working from a different directory, you can instead run:
-
-```
-go test github.com/heptio/contour/...
-```
 
 To run the tests for a single package, change to package directory and run:
 
 ```
 go test .
 ```
-
-_TIP_: If you are running the tests often, you can run `go test -i github.com/heptio/contour/...` occasionally to reduce test compilation times.
 
 ## Contribution workflow
 
@@ -100,6 +72,54 @@ It follows from the previous section, so if you haven't set up your Go workspace
 
 This project operates according to the _talk, then code_ rule.
 If you plan to submit a pull request for anything more than a typo or obvious bug fix, first you _should_ [raise an issue][6] to discuss your proposal, before submitting any code.
+
+Depending on the size of the feature you may be expected to first write a design proposal.
+A proposal template is [available here](https://github.com/heptio/contour/tree/master/design/design-document-tmpl.md)
+
+### Commit message and PR guidelines
+
+- Have a short subject on the first line and a body. The body can be empty.
+- Use the imperative mood (ie "If applied, this commit will (subject)" should make sense).
+- There must be a DCO line ("Signed-off-by: David Cheney <cheneyd@vmware.com>"), see [DCO Sign Off](#dco-sign-off) below
+- Put a summary of the main area affected by the commit at the start,
+with a colon as delimiter. For example 'docs:', 'internal/(packagename):', 'design:' or something similar.
+- Try to keep your number of commits in a PR low. Generally we
+tend to squash before opening the PR, then have PR feedback as
+extra commits.
+- If master has moved on, you'll need to rebase before we can merge,
+so merging upstream master or rebasing from upstream before opening your
+PR will probably save you some time.
+- PRs *must* include a `Fixes #NNNN` or `Updates #NNNN` comment. Remember that
+`Fixes` will close the associated issue, and `Updates` will link the PR to it.
+
+#### Commit message template
+
+```
+<packagename>: <imperative mood short description>
+
+Updates #NNNN
+Fixes #MMMM
+
+Signed-off-by: Your Name you@youremail.com
+
+<longer change description/justification>
+
+```
+
+#### Sample commit message
+
+```
+internal\contour: Add quux functions
+
+Fixes #xxyyz
+
+Signed-off-by: Your Name you@youremail.com
+
+To implement the quux functions from #xxyyz, we need to
+florble the greep dots, then ensure that the florble is
+warbed.
+```
+
 
 ### Pre commit CI
 
@@ -117,6 +137,13 @@ To build an image of your change using Contour's `Dockerfile`, run these command
 docker build -t docker.io/davecheney/contour:latest .
 docker push docker.io/davecheney/contour:latest
 ```
+or, you can use the make helper, like so:
+
+```
+REGISTRY=docker.io/davecheney VERSION=latest make push
+```
+
+This will push to `:latest` in `docker.io/davecheney` obviously you'll also need to replace the repo host with your own here too. If you don't specify `VERSION`, `make push` will push to a git hash tag (the output of ` git rev-parse --short=8 --verify HEAD`).
 
 ### Verify your change
 
@@ -134,7 +161,7 @@ project authors".
 To sign your work, just add a line like this at the end of your commit message:
 
 ```
-Signed-off-by: Joe Beda <joe@heptio.com>
+Signed-off-by: David Cheney <cheneyd@vmware.com>
 ```
 
 This can easily be done with the `--signoff` option to `git commit`.
@@ -182,7 +209,7 @@ By making a contribution to this project, I certify that:
 ```
 
 [1]: https://golang.org/dl/
-[2]: https://github.com/golang/dep
+[2]: https://github.com/golang/go/wiki/Modules
 [3]: https://golang.org/doc/code.html
 [4]: https://golang.org/pkg/testing/
 [5]: https://developercertificate.org/

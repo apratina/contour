@@ -19,6 +19,7 @@ import (
 
 	"github.com/envoyproxy/go-control-plane/envoy/api/v2"
 	"github.com/envoyproxy/go-control-plane/envoy/api/v2/auth"
+	"github.com/envoyproxy/go-control-plane/envoy/api/v2/core"
 	"github.com/envoyproxy/go-control-plane/envoy/api/v2/listener"
 	"github.com/google/go-cmp/cmp"
 	"github.com/heptio/contour/internal/dag"
@@ -34,29 +35,35 @@ func TestVisitClusters(t *testing.T) {
 		want map[string]*v2.Cluster
 	}{
 		"TCPService forward": {
-			root: &dag.SecureVirtualHost{
-				VirtualHost: dag.VirtualHost{
-					Port: 443,
-					Host: "www.example.com",
-					TCPProxy: &dag.TCPProxy{
-						Services: []*dag.TCPService{{
-							Name:      "example",
-							Namespace: "default",
-							ServicePort: &v1.ServicePort{
-								Protocol:   "TCP",
-								Port:       443,
-								TargetPort: intstr.FromInt(8443),
+			root: &dag.Listener{
+				Port: 443,
+				VirtualHosts: virtualhosts(
+					&dag.SecureVirtualHost{
+						VirtualHost: dag.VirtualHost{
+							Name: "www.example.com",
+							TCPProxy: &dag.TCPProxy{
+								Clusters: []*dag.Cluster{{
+									Upstream: &dag.TCPService{
+										Name:      "example",
+										Namespace: "default",
+										ServicePort: &v1.ServicePort{
+											Protocol:   "TCP",
+											Port:       443,
+											TargetPort: intstr.FromInt(8443),
+										},
+									},
+								}},
 							},
-						}},
+						},
+						Secret: new(dag.Secret),
 					},
-				},
-				Secret: new(dag.Secret),
+				),
 			},
 			want: clustermap(
 				&v2.Cluster{
-					Name:        "default/example/443/da39a3ee5e",
-					AltStatName: "default_example_443",
-					Type:        v2.Cluster_EDS,
+					Name:                 "default/example/443/da39a3ee5e",
+					AltStatName:          "default_example_443",
+					ClusterDiscoveryType: envoy.ClusterDiscoveryType(v2.Cluster_EDS),
 					EdsClusterConfig: &v2.Cluster_EdsClusterConfig{
 						EdsConfig:   envoy.ConfigSource("contour"),
 						ServiceName: "default/example",
@@ -81,13 +88,15 @@ func TestVisitClusters(t *testing.T) {
 
 func TestVisitListeners(t *testing.T) {
 	p1 := &dag.TCPProxy{
-		Services: []*dag.TCPService{{
-			Name:      "example",
-			Namespace: "default",
-			ServicePort: &v1.ServicePort{
-				Protocol:   "TCP",
-				Port:       443,
-				TargetPort: intstr.FromInt(8443),
+		Clusters: []*dag.Cluster{{
+			Upstream: &dag.TCPService{
+				Name:      "example",
+				Namespace: "default",
+				ServicePort: &v1.ServicePort{
+					Protocol:   "TCP",
+					Port:       443,
+					TargetPort: intstr.FromInt(8443),
+				},
 			},
 		}},
 	}
@@ -97,33 +106,37 @@ func TestVisitListeners(t *testing.T) {
 		want map[string]*v2.Listener
 	}{
 		"TCPService forward": {
-			root: &dag.SecureVirtualHost{
-				VirtualHost: dag.VirtualHost{
-					Port:     443,
-					Host:     "tcpproxy.example.com",
-					TCPProxy: p1,
-				},
-				Secret: &dag.Secret{
-					Object: &v1.Secret{
-						ObjectMeta: metav1.ObjectMeta{
-							Name:      "secret",
-							Namespace: "default",
+			root: &dag.Listener{
+				Port: 443,
+				VirtualHosts: virtualhosts(
+					&dag.SecureVirtualHost{
+						VirtualHost: dag.VirtualHost{
+							Name:     "tcpproxy.example.com",
+							TCPProxy: p1,
 						},
-						Data: secretdata("certificate", "key"),
+						Secret: &dag.Secret{
+							Object: &v1.Secret{
+								ObjectMeta: metav1.ObjectMeta{
+									Name:      "secret",
+									Namespace: "default",
+								},
+								Data: secretdata("certificate", "key"),
+							},
+						},
+						MinProtoVersion: auth.TlsParameters_TLSv1_1,
 					},
-				},
-				MinProtoVersion: auth.TlsParameters_TLSv1_1,
+				),
 			},
 			want: listenermap(
 				&v2.Listener{
 					Name:    ENVOY_HTTPS_LISTENER,
-					Address: envoy.SocketAddress("0.0.0.0", 8443),
+					Address: *envoy.SocketAddress("0.0.0.0", 8443),
 					FilterChains: []listener.FilterChain{{
 						FilterChainMatch: &listener.FilterChainMatch{
 							ServerNames: []string{"tcpproxy.example.com"},
 						},
 						TlsContext: tlscontext(auth.TlsParameters_TLSv1_1),
-						Filters:    filters(envoy.TCPProxy(ENVOY_HTTPS_LISTENER, p1, DEFAULT_HTTPS_ACCESS_LOG)),
+						Filters:    envoy.Filters(envoy.TCPProxy(ENVOY_HTTPS_LISTENER, p1, DEFAULT_HTTPS_ACCESS_LOG)),
 					}},
 					ListenerFilters: []listener.ListenerFilter{
 						envoy.TLSInspector(),
@@ -141,4 +154,85 @@ func TestVisitListeners(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestVisitSecrets(t *testing.T) {
+	tests := map[string]struct {
+		root dag.Visitable
+		want map[string]*auth.Secret
+	}{
+		"TCPService forward": {
+			root: &dag.Listener{
+				Port: 443,
+				VirtualHosts: virtualhosts(
+					&dag.SecureVirtualHost{
+						VirtualHost: dag.VirtualHost{
+							Name: "www.example.com",
+							TCPProxy: &dag.TCPProxy{
+								Clusters: []*dag.Cluster{{
+									Upstream: &dag.TCPService{
+										Name:      "example",
+										Namespace: "default",
+										ServicePort: &v1.ServicePort{
+											Protocol:   "TCP",
+											Port:       443,
+											TargetPort: intstr.FromInt(8443),
+										},
+									},
+								}},
+							},
+						},
+						Secret: &dag.Secret{
+							Object: &v1.Secret{
+								ObjectMeta: metav1.ObjectMeta{
+									Name:      "secret",
+									Namespace: "default",
+								},
+								Data: secretdata("certificate", "key"),
+							},
+						},
+					},
+				),
+			},
+			want: secretmap(&auth.Secret{
+				Name: "default/secret/735ad571c1",
+				Type: &auth.Secret_TlsCertificate{
+					TlsCertificate: &auth.TlsCertificate{
+						PrivateKey: &core.DataSource{
+							Specifier: &core.DataSource_InlineBytes{
+								InlineBytes: []byte("key"),
+							},
+						},
+						CertificateChain: &core.DataSource{
+							Specifier: &core.DataSource_InlineBytes{
+								InlineBytes: []byte("certificate"),
+							},
+						},
+					},
+				},
+			}),
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			got := visitSecrets(tc.root)
+			if diff := cmp.Diff(tc.want, got); diff != "" {
+				t.Fatal(diff)
+			}
+		})
+	}
+}
+
+func virtualhosts(vx ...dag.Vertex) map[string]dag.Vertex {
+	m := make(map[string]dag.Vertex)
+	for _, v := range vx {
+		switch v := v.(type) {
+		case *dag.VirtualHost:
+			m[v.Name] = v
+		case *dag.SecureVirtualHost:
+			m[v.VirtualHost.Name] = v
+		}
+	}
+	return m
 }

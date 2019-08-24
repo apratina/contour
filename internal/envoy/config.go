@@ -19,8 +19,6 @@ package envoy
 import (
 	"io"
 	"text/template"
-
-	"github.com/envoyproxy/go-control-plane/envoy/api/v2/core"
 )
 
 // A ConfigWriter knows how to write a bootstap Envoy configuration in YAML format.
@@ -37,12 +35,12 @@ type ConfigWriter struct {
 	// Defaults to 9001.
 	AdminPort int
 
-	// StatsAddress is the address that the /stats path will listen on.
-	// Defaults to 0.0.0.0 and is only enabled if StatsdEnabled is true.
+	// StatsAddress is the address that Envoy will listen on which serves the /stats path
+	// Defaults to 0.0.0.0
 	StatsAddress string
 
-	// StatsPort is the port that the /stats path will listen on.
-	// Defaults to 8002 and is only enabled if StatsdEnabled is true.
+	// StatsPort is the port that Envoy will listen on which serves the /stats path
+	// Defaults to 8002
 	StatsPort int
 
 	// XDSAddress is the TCP address of the XDS management server. For JSON configurations
@@ -58,18 +56,6 @@ type ConfigWriter struct {
 	// XDSGRPCPort is the management server port that provides the v2 gRPC API.
 	// Defaults to 8001.
 	XDSGRPCPort int
-
-	// StatsdEnabled enables metrics output via statsd
-	// Defaults to false.
-	StatsdEnabled bool
-
-	// StatsdAddress is the UDP address of the statsd endpoint
-	// Defaults to 127.0.0.1.
-	StatsdAddress string
-
-	// StatsdPort is port of the statsd endpoint
-	// Defaults to 9125.
-	StatsdPort int
 }
 
 const yamlConfig = `dynamic_resources:
@@ -108,7 +94,7 @@ static_resources:
           max_pending_requests: 100000
           max_requests: 60000000
           max_retries: 50
-  - name: service_stats
+  - name: service-stats
     connect_timeout: 0.250s
     type: LOGICAL_DNS
     lb_policy: ROUND_ROBIN
@@ -138,7 +124,7 @@ static_resources:
                         - match:
                             prefix: /stats
                           route:
-                            cluster: service_stats
+                            cluster: service-stats
                 http_filters:
                   - name: envoy.health_check
                     config:
@@ -148,15 +134,7 @@ static_resources:
                         exact_match: "/healthz"
                   - name: envoy.router
                     config:
-{{ if .StatsdEnabled }}stats_sinks:
-  - name: envoy.statsd
-    config:
-      address:
-        socket_address:
-          protocol: UDP
-          address: {{ if .StatsdAddress }}{{ .StatsdAddress }}{{ else }}127.0.0.1{{ end }}
-          port_value: {{ if .StatsdPort }}{{ .StatsdPort }}{{ else }}9125{{ end }}
-{{ end -}}admin:
+admin:
   access_log_path: {{ if .AdminAccessLogPath }}{{ .AdminAccessLogPath }}{{ else }}/dev/null{{ end }}
   address:
     socket_address:
@@ -172,22 +150,4 @@ func (c *ConfigWriter) WriteYAML(w io.Writer) error {
 		return err
 	}
 	return t.Execute(w, c)
-}
-
-// ConfigSource returns a *core.ConfigSource for cluster.
-func ConfigSource(cluster string) *core.ConfigSource {
-	return &core.ConfigSource{
-		ConfigSourceSpecifier: &core.ConfigSource_ApiConfigSource{
-			ApiConfigSource: &core.ApiConfigSource{
-				ApiType: core.ApiConfigSource_GRPC,
-				GrpcServices: []*core.GrpcService{{
-					TargetSpecifier: &core.GrpcService_EnvoyGrpc_{
-						EnvoyGrpc: &core.GrpcService_EnvoyGrpc{
-							ClusterName: cluster,
-						},
-					},
-				}},
-			},
-		},
-	}
 }

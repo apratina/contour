@@ -27,7 +27,7 @@ import (
 type Service struct {
 	httpsvc.Service
 
-	*dag.Builder
+	Builder *dag.Builder
 }
 
 // Start fulfills the g.Start contract.
@@ -50,10 +50,10 @@ func registerProfile(mux *http.ServeMux) {
 	mux.Handle("/debug/pprof/threadcreate", pprof.Handler("threadcreate"))
 }
 
-func registerDotWriter(mux *http.ServeMux, b *dag.Builder) {
+func registerDotWriter(mux *http.ServeMux, builder *dag.Builder) {
 	mux.HandleFunc("/debug/dag", func(w http.ResponseWriter, r *http.Request) {
 		dw := &dotWriter{
-			Builder: b,
+			Builder: builder,
 		}
 		dw.writeDot(w)
 	})

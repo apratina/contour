@@ -16,6 +16,7 @@ package grpc
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"sync/atomic"
 
 	"github.com/envoyproxy/go-control-plane/envoy/api/v2"
@@ -24,27 +25,27 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
+// Resource represents a source of proto.Messages that can be registered
+// for interest.
+type Resource interface {
+	// Contents returns the contents of this resource.
+	Contents() []proto.Message
+
+	// Query returns an entry for each resource name supplied.
+	Query(names []string) []proto.Message
+
+	// Register registers ch to receive a value when Notify is called.
+	Register(chan int, int)
+
+	// TypeURL returns the typeURL of messages returned from Values.
+	TypeURL() string
+}
+
 // xdsHandler implements the Envoy xDS gRPC protocol.
 type xdsHandler struct {
 	logrus.FieldLogger
 	connections counter
-	resources   map[string]resource // registered resource types
-}
-
-// fetch handles a single DiscoveryRequest.
-func (xh *xdsHandler) fetch(req *v2.DiscoveryRequest) (*v2.DiscoveryResponse, error) {
-	xh.WithField("connection", xh.connections.next()).WithField("version_info", req.VersionInfo).WithField("resource_names", req.ResourceNames).WithField("type_url", req.TypeUrl).WithField("response_nonce", req.ResponseNonce).WithField("error_detail", req.ErrorDetail).Info("fetch")
-	r, ok := xh.resources[req.TypeUrl]
-	if !ok {
-		return nil, fmt.Errorf("no resource registered for typeURL %q", req.TypeUrl)
-	}
-	resources, err := toAny(r, toFilter(req.ResourceNames))
-	return &v2.DiscoveryResponse{
-		VersionInfo: "0",
-		Resources:   resources,
-		TypeUrl:     r.TypeURL(),
-		Nonce:       "0",
-	}, err
+	resources   map[string]Resource // registered resource types
 }
 
 type grpcStream interface {
@@ -85,83 +86,80 @@ func (xh *xdsHandler) stream(st grpcStream) (err error) {
 			return err
 		}
 
+		// note: redeclare log in this scope so the next time around the loop all is forgotten.
+		log := log.WithField("version_info", req.VersionInfo).WithField("response_nonce", req.ResponseNonce)
+		if req.Node != nil {
+			log = log.WithField("node_id", req.Node.Id)
+		}
+
+		if err := req.ErrorDetail; err != nil {
+			// if Envoy rejected the last update log the details here.
+			// TODO(dfc) issue 1176: handle xDS ACK/NACK
+			log.WithField("code", err.Code).Error(err.Message)
+		}
+
 		// from the request we derive the resource to stream which have
 		// been registered according to the typeURL.
 		r, ok := xh.resources[req.TypeUrl]
 		if !ok {
 			return fmt.Errorf("no resource registered for typeURL %q", req.TypeUrl)
 		}
+		log = log.WithField("resource_names", req.ResourceNames).WithField("type_url", req.TypeUrl)
+		log.Info("stream_wait")
 
-		// stick some debugging details on the logger, not that we redeclare log in this scope
-		// so the next time around the loop all is forgotten.
-		log := log.WithField("version_info", req.VersionInfo).WithField("resource_names", req.ResourceNames).WithField("type_url", req.TypeUrl).WithField("response_nonce", req.ResponseNonce).WithField("error_detail", req.ErrorDetail)
+		// now we wait for a notification, if this is the first request received on this
+		// connection last will be less than zero and that will trigger a response immediately.
+		r.Register(ch, last)
+		select {
+		case last = <-ch:
+			// boom, something in the cache has changed.
+			// TODO(dfc) the thing that has changed may not be in the scope of the filter
+			// so we're going to be sending an update that is a no-op. See #426
 
-		for {
-			log.Info("stream_wait")
-
-			// now we wait for a notification, if this is the first time through the loop
-			// then last will be zero and that will trigger a notification immediately.
-			r.Register(ch, last)
-			select {
-			case last = <-ch:
-				// boom, something in the cache has changed.
-				// TODO(dfc) the thing that has changed may not be in the scope of the filter
-				// so we're going to be sending an update that is a no-op. See #426
-
-				// generate a filter from the request, then call toAny which
-				// will get r's (our resource) filter values, then convert them
-				// to the types.Any from required by gRPC.
-				resources, err := toAny(r, toFilter(req.ResourceNames))
-				if err != nil {
-					return err
-				}
-
-				resp := &v2.DiscoveryResponse{
-					VersionInfo: "0",
-					Resources:   resources,
-					TypeUrl:     r.TypeURL(),
-					Nonce:       "0",
-				}
-				if err := st.Send(resp); err != nil {
-					return err
-				}
-				log.WithField("count", len(resources)).Info("response")
-
-				// ok, the client hung up, return any error stored in the context and we're done.
-			case <-ctx.Done():
-				return ctx.Err()
+			var resources []proto.Message
+			switch len(req.ResourceNames) {
+			case 0:
+				// no resource hints supplied, return the full
+				// contents of the resource
+				resources = r.Contents()
+			default:
+				// resource hints supplied, return exactly those
+				resources = r.Query(req.ResourceNames)
 			}
+
+			any, err := toAny(r.TypeURL(), resources)
+			if err != nil {
+				return err
+			}
+
+			resp := &v2.DiscoveryResponse{
+				VersionInfo: strconv.Itoa(last),
+				Resources:   any,
+				TypeUrl:     r.TypeURL(),
+				Nonce:       strconv.Itoa(last),
+			}
+			if err := st.Send(resp); err != nil {
+				return err
+			}
+			log.WithField("count", len(resources)).Info("response")
+		case <-ctx.Done():
+			return ctx.Err()
 		}
 	}
 }
 
 // toAny converts the contents of a resourcer's Values to the
 // respective slice of types.Any.
-func toAny(res resource, filter func(string) bool) ([]types.Any, error) {
-	v := res.Values(filter)
-	resources := make([]types.Any, len(v))
-	for i := range v {
-		value, err := proto.Marshal(v[i])
+func toAny(typeURL string, values []proto.Message) ([]types.Any, error) {
+	var resources []types.Any
+	for _, value := range values {
+		v, err := proto.Marshal(value)
 		if err != nil {
 			return nil, err
 		}
-		resources[i] = types.Any{TypeUrl: res.TypeURL(), Value: value}
+		resources = append(resources, types.Any{TypeUrl: typeURL, Value: v})
 	}
 	return resources, nil
-}
-
-// toFilter converts a slice of strings into a filter function.
-// If the slice is empty, then a filter function that matches everything
-// is returned.
-func toFilter(names []string) func(string) bool {
-	if len(names) == 0 {
-		return func(string) bool { return true }
-	}
-	m := make(map[string]bool)
-	for _, n := range names {
-		m[n] = true
-	}
-	return func(name string) bool { return m[name] }
 }
 
 // counter holds an atomically incrementing counter.
