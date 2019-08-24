@@ -128,7 +128,14 @@ func UpgradeHTTPS() *route.Route_Redirect {
 
 // RouteHeaders returns a list of headers to be applied at the Route level on envoy
 func RouteHeaders() []*core.HeaderValueOption {
-	return []*core.HeaderValueOption{}
+	return []*core.HeaderValueOption{
+		{
+			Header: &core.HeaderValue{
+				Key:   "l5d-dst-override",
+				Value: "bar-service.bar-ns.svc.cluster.local:8080",
+			},
+		},
+	}
 }
 
 // weightedClusters returns a route.WeightedCluster for multiple services.
