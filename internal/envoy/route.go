@@ -132,7 +132,7 @@ func RouteHeaders() []*core.HeaderValueOption {
 		{
 			Header: &core.HeaderValue{
 				Key:   "l5d-dst-override",
-				Value: "bar-service.bar-ns.svc.cluster.local:8080",
+				Value: "bar-service.bar-ns.svc.cluster.local:80",
 			},
 		},
 	}
